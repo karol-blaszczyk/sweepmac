@@ -719,7 +719,7 @@ impl App {
                         section_header(ui, "extras");
                         card(ui, |ui| {
                             for (label, size) in &self.extras {
-                                let is_docker = label.contains("Colima");
+                                let is_docker = label.contains("Docker");
                                 let action = if is_docker {
                                     Pending::Docker { size: *size }
                                 } else {
@@ -733,7 +733,7 @@ impl App {
                         });
                         ui.add_space(2.0);
                         ui.label(
-                            RichText::new("Docker prunes build cache + unused images. Simulators removes unavailable devices.")
+                            RichText::new("Docker prune removes unused images + build cache inside the VM (keeps running containers + volumes). Note: it frees space in-VM but does not shrink the ~/.colima disk image on your Mac.")
                                 .size(10.5)
                                 .color(MUTED),
                         );

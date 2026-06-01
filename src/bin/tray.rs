@@ -310,7 +310,7 @@ fn spawn_scan(proxy: &EventLoopProxy<UserEvent>) {
         let extras = sweepmac::extras();
         let docker = extras
             .iter()
-            .find(|(l, _, _)| l.contains("Colima"))
+            .find(|(l, _, _)| l.contains("Docker"))
             .map(|(_, _, s)| *s)
             .unwrap_or(0);
         let sims = extras

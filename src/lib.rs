@@ -5,6 +5,7 @@
 
 use std::fs;
 use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -300,10 +301,13 @@ pub fn dir_size(path: &Path) -> u64 {
     if meta.file_type().is_symlink() {
         return 0;
     }
+    // Count *actual* allocated blocks (512-byte units), matching `du` — so a
+    // sparse file like the Colima VM image reports real on-disk usage, not its
+    // larger logical/apparent size.
     if meta.is_file() {
-        return meta.len();
+        return meta.blocks() * 512;
     }
-    let mut total = 0;
+    let mut total = meta.blocks() * 512; // the directory entry itself
     if let Ok(entries) = fs::read_dir(path) {
         for entry in entries.flatten() {
             total += dir_size(&entry.path());
@@ -337,33 +341,81 @@ pub fn clean_target(t: &Target, path: &Path) -> io::Result<()> {
     }
 }
 
-/// Informational extras (Docker/Colima VM, iOS simulators) — reported, not part
-/// of the cache catalogue because they need their own tooling to clean.
+/// Informational extras (Docker, iOS simulators) — reported, not part of the
+/// cache catalogue because they need their own tooling to clean.
+///
+/// Each tuple is `(label, path, size)`. For Docker, `size` is what a prune would
+/// reclaim *inside the VM* (from `docker system df`), NOT the host VM-image size
+/// — pruning frees space inside the VM but does not shrink `~/.colima` on disk.
 pub fn extras() -> Vec<(&'static str, PathBuf, u64)> {
     let home = match home() {
         Ok(h) => h,
         Err(_) => return Vec::new(),
     };
-    let candidates = [
-        ("Docker/Colima VM (~/.colima)", ".colima"),
-        (
-            "iOS Simulators (CoreSimulator)",
-            "Library/Developer/CoreSimulator",
-        ),
-    ];
-    candidates
-        .iter()
-        .filter_map(|(label, rel)| {
-            let p = home.join(rel);
-            if p.exists() {
-                let s = dir_size(&p);
-                if s > 0 {
-                    return Some((*label, p, s));
-                }
-            }
-            None
-        })
-        .collect()
+    let mut out: Vec<(&'static str, PathBuf, u64)> = Vec::new();
+
+    // Docker: report in-VM reclaimable (images + build cache).
+    if let Some(reclaimable) = docker_reclaimable() {
+        if reclaimable > 0 {
+            out.push((
+                "Docker images + build cache (in-VM)",
+                home.join(".colima"),
+                reclaimable,
+            ));
+        }
+    }
+
+    // iOS simulators: real on-disk size of unavailable-device clutter.
+    let sims = home.join("Library/Developer/CoreSimulator");
+    if sims.exists() {
+        let s = dir_size(&sims);
+        if s > 0 {
+            out.push(("iOS Simulators (CoreSimulator)", sims, s));
+        }
+    }
+    out
+}
+
+/// How much `docker builder/image prune -af` would reclaim inside the VM, in
+/// bytes (images + build cache). `None` if Docker isn't reachable.
+pub fn docker_reclaimable() -> Option<u64> {
+    let out = Command::new("docker")
+        .args(["system", "df", "--format", "{{.Type}}\t{{.Reclaimable}}"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut total = 0u64;
+    for line in text.lines() {
+        let mut parts = line.splitn(2, '\t');
+        let ty = parts.next().unwrap_or("").trim();
+        let recl = parts.next().unwrap_or("").trim();
+        if ty == "Images" || ty == "Build Cache" {
+            // e.g. "42.39GB (93%)" -> take the size token.
+            let val = recl.split_whitespace().next().unwrap_or("0B");
+            total += parse_docker_size(val).unwrap_or(0);
+        }
+    }
+    Some(total)
+}
+
+/// Parse a Docker size string like "42.39GB", "512MB", "0B" (decimal units).
+fn parse_docker_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let pos = s.find(|c: char| c.is_alphabetic())?;
+    let (num, unit) = s.split_at(pos);
+    let n: f64 = num.trim().parse().ok()?;
+    let mult = match unit.trim() {
+        "B" => 1.0,
+        "kB" | "KB" => 1e3,
+        "MB" => 1e6,
+        "GB" => 1e9,
+        "TB" => 1e12,
+        _ => 1.0,
+    };
+    Some((n * mult) as u64)
 }
 
 /// Run `docker builder prune -af` then `docker image prune -af`.
