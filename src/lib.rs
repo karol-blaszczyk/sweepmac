@@ -401,6 +401,137 @@ pub fn docker_reclaimable() -> Option<u64> {
     Some(total)
 }
 
+/// A Docker named volume.
+pub struct DockerVolume {
+    pub name: String,
+    pub size: u64,
+    /// True if a container currently mounts it (so it can't be removed).
+    pub in_use: bool,
+}
+
+/// Granular Docker reclaimable breakdown for the detailed panel.
+#[derive(Default)]
+pub struct DockerInfo {
+    pub build_cache: u64,
+    pub images: u64,     // reclaimable (unused) images
+    pub containers: u64, // reclaimable (stopped) containers
+    pub volumes: Vec<DockerVolume>,
+}
+
+impl DockerInfo {
+    /// Total bytes held by unused volumes (the safely-prunable ones).
+    pub fn unused_volume_bytes(&self) -> u64 {
+        self.volumes
+            .iter()
+            .filter(|v| !v.in_use)
+            .map(|v| v.size)
+            .sum()
+    }
+}
+
+/// Gather a granular Docker breakdown (per-type reclaimable + per-volume).
+/// `None` if Docker isn't reachable.
+pub fn docker_info() -> Option<DockerInfo> {
+    let df = Command::new("docker")
+        .args(["system", "df", "--format", "{{.Type}}\t{{.Reclaimable}}"])
+        .output()
+        .ok()?;
+    if !df.status.success() {
+        return None;
+    }
+    let mut info = DockerInfo::default();
+    let text = String::from_utf8_lossy(&df.stdout);
+    for line in text.lines() {
+        let mut parts = line.splitn(2, '\t');
+        let ty = parts.next().unwrap_or("").trim();
+        let recl = parts.next().unwrap_or("").trim();
+        let val = recl.split_whitespace().next().unwrap_or("0B");
+        let bytes = parse_docker_size(val).unwrap_or(0);
+        match ty {
+            "Images" => info.images = bytes,
+            "Containers" => info.containers = bytes,
+            "Build Cache" => info.build_cache = bytes,
+            _ => {}
+        }
+    }
+    info.volumes = docker_volumes();
+    Some(info)
+}
+
+/// Per-volume name, size, and in-use status, parsed from `docker system df -v`.
+fn docker_volumes() -> Vec<DockerVolume> {
+    let out = match Command::new("docker").args(["system", "df", "-v"]).output() {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut vols = Vec::new();
+    let mut in_section = false;
+    for line in text.lines() {
+        if line.contains("VOLUME NAME") {
+            in_section = true;
+            continue;
+        }
+        if in_section {
+            if line.trim().is_empty() {
+                break;
+            }
+            // Columns: NAME  LINKS  SIZE (volume names have no spaces).
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() >= 3 {
+                let links: u32 = cols[1].parse().unwrap_or(0);
+                let size = parse_docker_size(cols[cols.len() - 1]).unwrap_or(0);
+                vols.push(DockerVolume {
+                    name: cols[0].to_string(),
+                    size,
+                    in_use: links > 0,
+                });
+            }
+        }
+    }
+    vols.sort_by(|a, b| b.size.cmp(&a.size));
+    vols
+}
+
+/// Run a single `docker <kind> prune` (kind: builder|image|container|network).
+/// Returns combined output, or an error string.
+pub fn docker_prune_kind(kind: &str) -> Result<String, String> {
+    let args: &[&str] = match kind {
+        "builder" => &["builder", "prune", "-af"],
+        "image" => &["image", "prune", "-af"],
+        "container" => &["container", "prune", "-f"],
+        "network" => &["network", "prune", "-f"],
+        _ => return Err(format!("unknown prune kind: {kind}")),
+    };
+    let out = Command::new("docker")
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Remove specific Docker volumes by name. Returns combined output.
+pub fn docker_volume_rm(names: &[String]) -> Result<String, String> {
+    if names.is_empty() {
+        return Ok(String::new());
+    }
+    let mut args = vec!["volume".to_string(), "rm".to_string()];
+    args.extend(names.iter().cloned());
+    let out = Command::new("docker")
+        .args(&args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
 /// Parse a Docker size string like "42.39GB", "512MB", "0B" (decimal units).
 fn parse_docker_size(s: &str) -> Option<u64> {
     let s = s.trim();

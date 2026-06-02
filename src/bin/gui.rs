@@ -15,8 +15,9 @@ use std::time::Instant;
 use eframe::egui;
 use egui::{Color32, Margin, RichText, Rounding};
 use sweepmac::{
-    clean_target, disk_free, extras, find_node_modules, home, human, persist_pty_limit, pty_status,
-    raise_pty_limit, scan, target_by_id, NodeModules, PtyLevel, PtyStatus, ALL_CATEGORIES,
+    clean_target, disk_free, docker_info, extras, find_node_modules, home, human,
+    persist_pty_limit, pty_status, raise_pty_limit, scan, target_by_id, DockerInfo, DockerVolume,
+    NodeModules, PtyLevel, PtyStatus, ALL_CATEGORIES,
 };
 
 const PTY_TARGET: u64 = 999;
@@ -119,11 +120,19 @@ enum Pending {
         size: u64,
         path: PathBuf,
     },
-    Docker {
-        size: u64,
-    },
     Simulators {
         size: u64,
+    },
+    /// Prune a single Docker category (kind: builder|image|container|network).
+    DockerPrune {
+        kind: &'static str,
+        label: String,
+        size: u64,
+    },
+    /// Delete specific Docker volumes (destroys their data).
+    DockerVolumes {
+        names: Vec<String>,
+        total: u64,
     },
     /// Delete one or more selected node_modules folders.
     NodeModulesBulk {
@@ -138,6 +147,7 @@ enum Msg {
         extras: Vec<(String, u64)>,
         disk: (u64, u64),
         pty: Option<PtyStatus>,
+        docker: Option<DockerInfo>,
     },
     /// node_modules discovery finished (runs separately — it's slower).
     NmScanned(Vec<NodeModules>),
@@ -174,6 +184,8 @@ struct App {
     extras: Vec<(String, u64)>,
     disk: (u64, u64),
     pty: Option<PtyStatus>,
+    docker: Option<DockerInfo>,
+    dvol_selected: std::collections::HashSet<String>,
     node_modules: Vec<NodeModules>,
     nm_selected: std::collections::HashSet<PathBuf>,
     nm_scanning: bool,
@@ -194,6 +206,8 @@ impl App {
             extras: Vec::new(),
             disk: (0, 0),
             pty: None,
+            docker: None,
+            dvol_selected: std::collections::HashSet::new(),
             node_modules: Vec::new(),
             nm_selected: std::collections::HashSet::new(),
             nm_scanning: false,
@@ -260,11 +274,13 @@ impl App {
                 .collect();
             let disk = disk_free().unwrap_or((0, 0));
             let pty = pty_status();
+            let docker = docker_info();
             let _ = tx.send(Msg::Scanned {
                 rows,
                 extras,
                 disk,
                 pty,
+                docker,
             });
             ctx.request_repaint();
         });
@@ -345,11 +361,31 @@ impl App {
                     ctx.request_repaint();
                 });
             }
-            Pending::Docker { .. } => {
-                self.status = "Pruning Docker…".into();
+            Pending::DockerPrune { kind, label, .. } => {
+                self.status = format!("Pruning {label}…");
                 thread::spawn(move || {
-                    stream(&tx, &ctx, "docker", &["builder", "prune", "-af"]);
-                    stream(&tx, &ctx, "docker", &["image", "prune", "-af"]);
+                    let args: &[&str] = match kind {
+                        "builder" => &["builder", "prune", "-af"],
+                        "image" => &["image", "prune", "-af"],
+                        "container" => &["container", "prune", "-f"],
+                        "network" => &["network", "prune", "-f"],
+                        _ => &[],
+                    };
+                    let _ = tx.send(Msg::Log(format!("$ docker {}", args.join(" "))));
+                    ctx.request_repaint();
+                    stream(&tx, &ctx, "docker", args);
+                    let _ = tx.send(Msg::Cleaned { freed: 0 });
+                    ctx.request_repaint();
+                });
+            }
+            Pending::DockerVolumes { names, total } => {
+                self.status = format!("Deleting {} volume(s) ({})…", names.len(), human(total));
+                thread::spawn(move || {
+                    for name in &names {
+                        let _ = tx.send(Msg::Log(format!("$ docker volume rm {name}")));
+                        ctx.request_repaint();
+                        stream(&tx, &ctx, "docker", &["volume", "rm", name]);
+                    }
                     let _ = tx.send(Msg::Cleaned { freed: 0 });
                     ctx.request_repaint();
                 });
@@ -427,11 +463,13 @@ impl App {
                     extras,
                     disk,
                     pty,
+                    docker,
                 } => {
                     self.rows = rows;
                     self.extras = extras;
                     self.disk = disk;
                     self.pty = pty;
+                    self.docker = docker;
                     self.phase = Phase::Idle;
                     self.started = None;
                     self.status = format!("{} reclaimable", human(self.cache_total()));
@@ -447,6 +485,7 @@ impl App {
                 Msg::Cleaned { freed } => {
                     self.phase = Phase::Idle;
                     self.started = None;
+                    self.dvol_selected.clear();
                     self.status = if freed > 0 {
                         format!("Reclaimed {}", human(freed))
                     } else {
@@ -666,6 +705,10 @@ impl App {
                 let mut nm_toggles: Vec<PathBuf> = Vec::new();
                 let mut nm_set_all: Option<bool> = None;
                 let mut nm_clear_selected = false;
+                // Docker volume selection snapshot.
+                let dvol_sel = self.dvol_selected.clone();
+                let mut dvol_toggles: Vec<String> = Vec::new();
+                let mut dvol_delete = false;
 
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     // Pseudo-terminal warning banner (only when near/at the cap).
@@ -714,29 +757,105 @@ impl App {
                         );
                     }
 
-                    // Extras: Docker + simulators, each with its own action.
-                    if !self.extras.is_empty() {
-                        section_header(ui, "extras");
+                    // Docker — granular prune actions + per-volume management.
+                    if let Some(d) = &self.docker {
+                        section_header(ui, "docker");
                         card(ui, |ui| {
-                            for (label, size) in &self.extras {
-                                let is_docker = label.contains("Docker");
-                                let action = if is_docker {
-                                    Pending::Docker { size: *size }
-                                } else {
-                                    Pending::Simulators { size: *size }
-                                };
-                                let verb = if is_docker { "Prune" } else { "Delete" };
-                                if extra_row(ui, label, *size, verb, can_act) {
-                                    request = Some(action);
+                            let cats = [
+                                ("builder", "Build cache", d.build_cache),
+                                ("image", "Unused images", d.images),
+                                ("container", "Stopped containers", d.containers),
+                            ];
+                            for (n, (kind, label, size)) in cats.into_iter().enumerate() {
+                                if n > 0 {
+                                    ui.add_space(2.0);
+                                }
+                                if docker_prune_row(ui, label, size, can_act, false) {
+                                    request = Some(Pending::DockerPrune {
+                                        kind,
+                                        label: label.to_string(),
+                                        size,
+                                    });
                                 }
                             }
+                            // Networks: no size, count-less; offer a plain prune.
+                            ui.add_space(2.0);
+                            if docker_prune_row(ui, "Unused networks", 0, can_act, true) {
+                                request = Some(Pending::DockerPrune {
+                                    kind: "network",
+                                    label: "Unused networks".into(),
+                                    size: 0,
+                                });
+                            }
                         });
-                        ui.add_space(2.0);
+
+                        // Volumes (data!) — pick exactly which to delete.
+                        if !d.volumes.is_empty() {
+                            let dsel_count =
+                                d.volumes.iter().filter(|v| dvol_sel.contains(&v.name)).count();
+                            let dsel_total: u64 = d
+                                .volumes
+                                .iter()
+                                .filter(|v| dvol_sel.contains(&v.name))
+                                .map(|v| v.size)
+                                .sum();
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new("Volumes — contain data; deleting is permanent")
+                                    .size(11.0)
+                                    .strong()
+                                    .color(DANGER),
+                            );
+                            card(ui, |ui| {
+                                for (n, v) in d.volumes.iter().enumerate() {
+                                    if n > 0 {
+                                        ui.add_space(2.0);
+                                    }
+                                    let checked = dvol_sel.contains(&v.name);
+                                    if docker_volume_row(ui, v, checked, can_act) {
+                                        dvol_toggles.push(v.name.clone());
+                                    }
+                                }
+                            });
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(if dsel_count > 0 {
+                                        format!("{dsel_count} selected · {}", human(dsel_total))
+                                    } else {
+                                        "Tick unused volumes to delete".into()
+                                    })
+                                    .size(11.5)
+                                    .color(MUTED),
+                                );
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let enabled = can_act && dsel_count > 0;
+                                    let btn = danger_button(&format!("Delete {dsel_count} volume(s)"));
+                                    if ui.add_enabled(enabled, btn).clicked() {
+                                        dvol_delete = true;
+                                    }
+                                });
+                            });
+                        }
                         ui.label(
-                            RichText::new("Docker prune removes unused images + build cache inside the VM (keeps running containers + volumes). Note: it frees space in-VM but does not shrink the ~/.colima disk image on your Mac.")
+                            RichText::new("Prune frees space inside the VM (keeps running containers). It does not shrink the ~/.colima disk image on your Mac.")
                                 .size(10.5)
                                 .color(MUTED),
                         );
+                    }
+
+                    // iOS simulators (from extras; Docker is handled above).
+                    let sim_extras: Vec<&(String, u64)> =
+                        self.extras.iter().filter(|(l, _)| !l.contains("Docker")).collect();
+                    if !sim_extras.is_empty() {
+                        section_header(ui, "extras");
+                        card(ui, |ui| {
+                            for (label, size) in sim_extras {
+                                if extra_row(ui, label, *size, "Delete", can_act) {
+                                    request = Some(Pending::Simulators { size: *size });
+                                }
+                            }
+                        });
                     }
 
                     // node_modules — discovered project dependency folders.
@@ -861,6 +980,27 @@ impl App {
                     }
                 }
 
+                // Apply Docker volume selection changes.
+                for name in dvol_toggles {
+                    if !self.dvol_selected.remove(&name) {
+                        self.dvol_selected.insert(name);
+                    }
+                }
+                if dvol_delete {
+                    if let Some(d) = &self.docker {
+                        let chosen: Vec<&DockerVolume> = d
+                            .volumes
+                            .iter()
+                            .filter(|v| self.dvol_selected.contains(&v.name))
+                            .collect();
+                        let total = chosen.iter().map(|v| v.size).sum();
+                        let names: Vec<String> = chosen.iter().map(|v| v.name.clone()).collect();
+                        if !names.is_empty() {
+                            request = Some(Pending::DockerVolumes { names, total });
+                        }
+                    }
+                }
+
                 if let Some(p) = request {
                     self.pending = Some(p);
                 }
@@ -883,10 +1023,24 @@ impl App {
                 format!("Clear “{desc}” and reclaim {}?", human(*size)),
                 *size,
             ),
-            Pending::Docker { size } => (
+            Pending::DockerPrune { label, size, .. } => (
                 "Prune Docker",
-                format!("Prune Docker build cache and unused images (~{})?", human(*size)),
+                if *size > 0 {
+                    format!("Prune {} (~{})? Running containers + volumes are kept.", label.to_lowercase(), human(*size))
+                } else {
+                    format!("Prune {}? Running containers + volumes are kept.", label.to_lowercase())
+                },
                 *size,
+            ),
+            Pending::DockerVolumes { names, total } => (
+                "Delete Docker volumes",
+                format!(
+                    "⚠ Permanently delete {} volume{} and ALL their data ({})?\n\nThis cannot be undone.",
+                    names.len(),
+                    if names.len() == 1 { "" } else { "s" },
+                    human(*total)
+                ),
+                *total,
             ),
             Pending::Simulators { size } => (
                 "Delete simulators",
@@ -968,6 +1122,20 @@ impl App {
                                         });
                                     }
                                 });
+                        });
+                }
+                // For volume deletion, list the volume names being destroyed.
+                if let Pending::DockerVolumes { names, .. } = &pending {
+                    ui.add_space(8.0);
+                    egui::Frame::default()
+                        .fill(Color32::from_rgb(0x10, 0x12, 0x16))
+                        .rounding(Rounding::same(8.0))
+                        .inner_margin(Margin::symmetric(10.0, 8.0))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            for name in names {
+                                ui.label(RichText::new(name).size(11.0).monospace().color(MUTED));
+                            }
                         });
                 }
                 ui.add_space(16.0);
@@ -1078,6 +1246,81 @@ fn extra_row(ui: &mut egui::Ui, label: &str, size: u64, verb: &str, can_act: boo
         });
     });
     clicked
+}
+
+/// One Docker prune category row. Returns true when "Prune" is clicked.
+/// `allow_empty` lets count-less actions (networks) stay clickable at size 0.
+fn docker_prune_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    size: u64,
+    can_act: bool,
+    allow_empty: bool,
+) -> bool {
+    let mut clicked = false;
+    let actionable = size > 0 || allow_empty;
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(label)
+                .size(13.0)
+                .color(if actionable { TEXT } else { MUTED }),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add_enabled(can_act && actionable, accent_button("Prune"))
+                .clicked()
+            {
+                clicked = true;
+            }
+            ui.add_space(8.0);
+            let txt = if size > 0 {
+                human(size)
+            } else {
+                "—".to_string()
+            };
+            ui.label(
+                RichText::new(txt)
+                    .size(12.5)
+                    .monospace()
+                    .color(if size > 0 { TEXT } else { MUTED }),
+            );
+        });
+    });
+    clicked
+}
+
+/// One Docker volume row with a checkbox. In-use volumes are locked (can't be
+/// removed while a container mounts them). Returns true when the box toggles.
+fn docker_volume_row(ui: &mut egui::Ui, v: &DockerVolume, checked: bool, can_act: bool) -> bool {
+    let mut toggled = false;
+    let selectable = can_act && !v.in_use;
+    ui.horizontal(|ui| {
+        let mut c = checked;
+        if ui
+            .add_enabled(selectable, egui::Checkbox::new(&mut c, ""))
+            .changed()
+        {
+            toggled = true;
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                RichText::new(human(v.size))
+                    .size(12.5)
+                    .monospace()
+                    .color(TEXT),
+            );
+            ui.add_space(8.0);
+            if v.in_use {
+                ui.label(RichText::new("in use").size(10.5).color(AMBER));
+                ui.add_space(6.0);
+            }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                let color = if v.in_use { MUTED } else { TEXT };
+                ui.add(egui::Label::new(RichText::new(&v.name).size(12.0).color(color)).truncate());
+            });
+        });
+    });
+    toggled
 }
 
 /// One node_modules row with a checkbox. Returns true when the checkbox toggles.
