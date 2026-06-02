@@ -31,7 +31,14 @@ done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/sweepmac.icns"
 
 echo "==> building dmg"
-hdiutil create -volname sweepmac -srcfolder "$APP" -ov -format UDZO dist/sweepmac.dmg >/dev/null
+# Stage the .app next to an Applications shortcut so users can drag-to-install.
+STAGE="dist/dmg"
+rm -rf "$STAGE"
+mkdir -p "$STAGE"
+cp -R "$APP" "$STAGE/"
+ln -s /Applications "$STAGE/Applications"
+hdiutil create -volname sweepmac -srcfolder "$STAGE" -ov -format UDZO dist/sweepmac.dmg >/dev/null
+rm -rf "$STAGE"
 
 echo "==> done:"
 echo "    $APP"
