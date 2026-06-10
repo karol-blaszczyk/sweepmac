@@ -15,7 +15,7 @@ use std::time::Instant;
 use eframe::egui;
 use egui::{Color32, Margin, RichText, Rounding};
 use sweepmac::{
-    clean_target, disk_free, docker_info, extras, find_node_modules, home, human,
+    clean_target, dir_size, disk_free, docker_info, find_node_modules, home, human,
     persist_pty_limit, pty_status, raise_pty_limit, scan, target_by_id, DockerInfo, DockerVolume,
     NodeModules, PtyLevel, PtyStatus, ALL_CATEGORIES,
 };
@@ -147,8 +147,9 @@ enum Msg {
         extras: Vec<(String, u64)>,
         disk: (u64, u64),
         pty: Option<PtyStatus>,
-        docker: Option<DockerInfo>,
     },
+    /// Docker breakdown finished (separate — `docker system df -v` is slow).
+    DockerScanned(Option<DockerInfo>),
     /// node_modules discovery finished (runs separately — it's slower).
     NmScanned(Vec<NodeModules>),
     /// A live output line from a running operation.
@@ -185,6 +186,7 @@ struct App {
     disk: (u64, u64),
     pty: Option<PtyStatus>,
     docker: Option<DockerInfo>,
+    docker_scanning: bool,
     dvol_selected: std::collections::HashSet<String>,
     node_modules: Vec<NodeModules>,
     nm_selected: std::collections::HashSet<PathBuf>,
@@ -195,6 +197,7 @@ struct App {
     started: Option<Instant>,
     rx: Option<Receiver<Msg>>,
     nm_rx: Option<Receiver<Msg>>,
+    docker_rx: Option<Receiver<Msg>>,
 }
 
 impl App {
@@ -207,6 +210,7 @@ impl App {
             disk: (0, 0),
             pty: None,
             docker: None,
+            docker_scanning: false,
             dvol_selected: std::collections::HashSet::new(),
             node_modules: Vec::new(),
             nm_selected: std::collections::HashSet::new(),
@@ -217,10 +221,26 @@ impl App {
             started: None,
             rx: None,
             nm_rx: None,
+            docker_rx: None,
         };
         app.start_scan();
         app.start_nm_scan();
+        app.start_docker_scan();
         app
+    }
+
+    /// Query Docker on its own thread — `docker system df -v` can take ~15s, so
+    /// it must not block the cache view or button interactivity.
+    fn start_docker_scan(&mut self) {
+        self.docker_scanning = true;
+        let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
+        self.docker_rx = Some(rx);
+        let ctx = self.ctx.clone();
+        thread::spawn(move || {
+            let info = docker_info();
+            let _ = tx.send(Msg::DockerScanned(info));
+            ctx.request_repaint();
+        });
     }
 
     /// Discover node_modules dirs on a background thread (slower than caches,
@@ -268,19 +288,23 @@ impl App {
                     size: r.size,
                 })
                 .collect();
-            let extras = extras()
-                .into_iter()
-                .map(|(l, _p, s)| (l.to_string(), s))
-                .collect();
+            // Only the iOS simulator size here (fast-ish). Docker is scanned
+            // separately because `docker system df -v` is slow.
+            let extras = home()
+                .ok()
+                .map(|h| h.join("Library/Developer/CoreSimulator"))
+                .filter(|p| p.exists())
+                .map(|p| dir_size(&p))
+                .filter(|s| *s > 0)
+                .map(|s| vec![("iOS Simulators (CoreSimulator)".to_string(), s)])
+                .unwrap_or_default();
             let disk = disk_free().unwrap_or((0, 0));
             let pty = pty_status();
-            let docker = docker_info();
             let _ = tx.send(Msg::Scanned {
                 rows,
                 extras,
                 disk,
                 pty,
-                docker,
             });
             ctx.request_repaint();
         });
@@ -463,18 +487,17 @@ impl App {
                     extras,
                     disk,
                     pty,
-                    docker,
                 } => {
                     self.rows = rows;
                     self.extras = extras;
                     self.disk = disk;
                     self.pty = pty;
-                    self.docker = docker;
                     self.phase = Phase::Idle;
                     self.started = None;
                     self.status = format!("{} reclaimable", human(self.cache_total()));
                     self.rx = None;
                 }
+                Msg::DockerScanned(_) => {} // arrives on docker_rx, handled below
                 Msg::PtyDone { note } => {
                     self.phase = Phase::Idle;
                     self.started = None;
@@ -492,6 +515,7 @@ impl App {
                         "Done".into()
                     };
                     self.start_scan(); // replaces self.rx with the scan channel
+                    self.start_docker_scan(); // refresh Docker too (e.g. after prune)
                 }
                 Msg::NmRemoved { path } => {
                     self.node_modules.retain(|n| n.path != path);
@@ -519,6 +543,21 @@ impl App {
                 self.node_modules = found;
                 self.nm_scanning = false;
                 self.nm_rx = None;
+            }
+        }
+
+        // Docker scan runs on its own (slow) channel.
+        let mut docker_batch: Vec<Msg> = Vec::new();
+        if let Some(rx) = &self.docker_rx {
+            while let Ok(msg) = rx.try_recv() {
+                docker_batch.push(msg);
+            }
+        }
+        for msg in docker_batch {
+            if let Msg::DockerScanned(info) = msg {
+                self.docker = info;
+                self.docker_scanning = false;
+                self.docker_rx = None;
             }
         }
     }
@@ -695,7 +734,9 @@ impl App {
                     return;
                 }
 
-                let can_act = self.phase == Phase::Idle;
+                // Only a running *cleanup* blocks actions — a background (re)scan
+                // must not grey out the whole UI.
+                let can_act = self.phase != Phase::Cleaning;
                 // Collect actions to run after the borrow ends (avoids borrow conflict).
                 let mut request: Option<Pending> = None;
                 let mut rescan_nm = false;
@@ -758,6 +799,17 @@ impl App {
                     }
 
                     // Docker — granular prune actions + per-volume management.
+                    if self.docker.is_none() && self.docker_scanning {
+                        section_header(ui, "docker");
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new().size(12.0));
+                            ui.label(
+                                RichText::new("querying Docker (docker system df)…")
+                                    .size(11.5)
+                                    .color(MUTED),
+                            );
+                        });
+                    }
                     if let Some(d) = &self.docker {
                         section_header(ui, "docker");
                         card(ui, |ui| {
