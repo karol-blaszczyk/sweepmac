@@ -16,8 +16,8 @@ use eframe::egui;
 use egui::{Color32, Margin, RichText, Rounding};
 use sweepmac::{
     clean_target, dir_size, disk_free, docker_info, find_node_modules, home, human,
-    persist_pty_limit, pty_status, raise_pty_limit, scan, target_by_id, DockerInfo, DockerVolume,
-    NodeModules, PtyLevel, PtyStatus, ALL_CATEGORIES,
+    persist_pty_limit, pty_status, raise_pty_limit, scan, target_by_id, DockerImage, DockerInfo,
+    DockerVolume, NodeModules, PtyLevel, PtyStatus, ALL_CATEGORIES,
 };
 
 const PTY_TARGET: u64 = 999;
@@ -134,6 +134,12 @@ enum Pending {
         names: Vec<String>,
         total: u64,
     },
+    /// Remove specific Docker images by id.
+    DockerImages {
+        ids: Vec<String>,
+        names: Vec<String>,
+        total: u64,
+    },
     /// Delete one or more selected node_modules folders.
     NodeModulesBulk {
         items: Vec<BulkItem>,
@@ -188,6 +194,7 @@ struct App {
     docker: Option<DockerInfo>,
     docker_scanning: bool,
     dvol_selected: std::collections::HashSet<String>,
+    dimg_selected: std::collections::HashSet<String>,
     node_modules: Vec<NodeModules>,
     nm_selected: std::collections::HashSet<PathBuf>,
     nm_scanning: bool,
@@ -212,6 +219,7 @@ impl App {
             docker: None,
             docker_scanning: false,
             dvol_selected: std::collections::HashSet::new(),
+            dimg_selected: std::collections::HashSet::new(),
             node_modules: Vec::new(),
             nm_selected: std::collections::HashSet::new(),
             nm_scanning: false,
@@ -414,6 +422,19 @@ impl App {
                     ctx.request_repaint();
                 });
             }
+            Pending::DockerImages { ids, names, total } => {
+                self.status = format!("Removing {} image(s) ({})…", ids.len(), human(total));
+                thread::spawn(move || {
+                    let _ = tx.send(Msg::Log(format!("$ docker rmi {}", names.join(" "))));
+                    ctx.request_repaint();
+                    let refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+                    let mut args = vec!["rmi"];
+                    args.extend(refs);
+                    stream(&tx, &ctx, "docker", &args);
+                    let _ = tx.send(Msg::Cleaned { freed: 0 });
+                    ctx.request_repaint();
+                });
+            }
             Pending::Simulators { .. } => {
                 self.status = "Deleting unavailable simulators…".into();
                 thread::spawn(move || {
@@ -509,6 +530,7 @@ impl App {
                     self.phase = Phase::Idle;
                     self.started = None;
                     self.dvol_selected.clear();
+                    self.dimg_selected.clear();
                     self.status = if freed > 0 {
                         format!("Reclaimed {}", human(freed))
                     } else {
@@ -750,6 +772,10 @@ impl App {
                 let dvol_sel = self.dvol_selected.clone();
                 let mut dvol_toggles: Vec<String> = Vec::new();
                 let mut dvol_delete = false;
+                // Docker image selection snapshot.
+                let dimg_sel = self.dimg_selected.clone();
+                let mut dimg_toggles: Vec<String> = Vec::new();
+                let mut dimg_delete = false;
 
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     // Pseudo-terminal warning banner (only when near/at the cap).
@@ -840,6 +866,55 @@ impl App {
                                 });
                             }
                         });
+
+                        // Images — pick exactly which to remove.
+                        if !d.image_list.is_empty() {
+                            let isel_count =
+                                d.image_list.iter().filter(|i| dimg_sel.contains(&i.id)).count();
+                            let isel_total: u64 = d
+                                .image_list
+                                .iter()
+                                .filter(|i| dimg_sel.contains(&i.id))
+                                .map(|i| i.size)
+                                .sum();
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new(format!("Images ({})", d.image_list.len()))
+                                    .size(11.0)
+                                    .strong()
+                                    .color(MUTED),
+                            );
+                            card(ui, |ui| {
+                                for (n, img) in d.image_list.iter().enumerate() {
+                                    if n > 0 {
+                                        ui.add_space(2.0);
+                                    }
+                                    let checked = dimg_sel.contains(&img.id);
+                                    if docker_image_row(ui, img, checked, can_act) {
+                                        dimg_toggles.push(img.id.clone());
+                                    }
+                                }
+                            });
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(if isel_count > 0 {
+                                        format!("{isel_count} selected · {}", human(isel_total))
+                                    } else {
+                                        "Tick images to remove (in-use are locked)".into()
+                                    })
+                                    .size(11.5)
+                                    .color(MUTED),
+                                );
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let enabled = can_act && isel_count > 0;
+                                    let btn = danger_button(&format!("Remove {isel_count} image(s)"));
+                                    if ui.add_enabled(enabled, btn).clicked() {
+                                        dimg_delete = true;
+                                    }
+                                });
+                            });
+                        }
 
                         // Volumes (data!) — pick exactly which to delete.
                         if !d.volumes.is_empty() {
@@ -1053,6 +1128,28 @@ impl App {
                     }
                 }
 
+                // Apply Docker image selection changes.
+                for id in dimg_toggles {
+                    if !self.dimg_selected.remove(&id) {
+                        self.dimg_selected.insert(id);
+                    }
+                }
+                if dimg_delete {
+                    if let Some(d) = &self.docker {
+                        let chosen: Vec<&DockerImage> = d
+                            .image_list
+                            .iter()
+                            .filter(|i| self.dimg_selected.contains(&i.id))
+                            .collect();
+                        let total = chosen.iter().map(|i| i.size).sum();
+                        let ids: Vec<String> = chosen.iter().map(|i| i.id.clone()).collect();
+                        let names: Vec<String> = chosen.iter().map(|i| i.name.clone()).collect();
+                        if !ids.is_empty() {
+                            request = Some(Pending::DockerImages { ids, names, total });
+                        }
+                    }
+                }
+
                 if let Some(p) = request {
                     self.pending = Some(p);
                 }
@@ -1090,6 +1187,16 @@ impl App {
                     "⚠ Permanently delete {} volume{} and ALL their data ({})?\n\nThis cannot be undone.",
                     names.len(),
                     if names.len() == 1 { "" } else { "s" },
+                    human(*total)
+                ),
+                *total,
+            ),
+            Pending::DockerImages { ids, total, .. } => (
+                "Remove Docker images",
+                format!(
+                    "Remove {} image{} ({})? They'll re-pull/rebuild when next needed.",
+                    ids.len(),
+                    if ids.len() == 1 { "" } else { "s" },
                     human(*total)
                 ),
                 *total,
@@ -1188,6 +1295,32 @@ impl App {
                             for name in names {
                                 ui.label(RichText::new(name).size(11.0).monospace().color(MUTED));
                             }
+                        });
+                }
+                // For image removal, list the image names.
+                if let Pending::DockerImages { names, .. } = &pending {
+                    ui.add_space(8.0);
+                    egui::Frame::default()
+                        .fill(Color32::from_rgb(0x10, 0x12, 0x16))
+                        .rounding(Rounding::same(8.0))
+                        .inner_margin(Margin::symmetric(10.0, 8.0))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            egui::ScrollArea::vertical()
+                                .max_height(160.0)
+                                .show(ui, |ui| {
+                                    for name in names {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(name)
+                                                    .size(11.0)
+                                                    .monospace()
+                                                    .color(MUTED),
+                                            )
+                                            .truncate(),
+                                        );
+                                    }
+                                });
                         });
                 }
                 ui.add_space(16.0);
@@ -1369,6 +1502,42 @@ fn docker_volume_row(ui: &mut egui::Ui, v: &DockerVolume, checked: bool, can_act
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 let color = if v.in_use { MUTED } else { TEXT };
                 ui.add(egui::Label::new(RichText::new(&v.name).size(12.0).color(color)).truncate());
+            });
+        });
+    });
+    toggled
+}
+
+/// One Docker image row with a checkbox. In-use images are locked (a container
+/// references them). Returns true when the box toggles.
+fn docker_image_row(ui: &mut egui::Ui, img: &DockerImage, checked: bool, can_act: bool) -> bool {
+    let mut toggled = false;
+    let selectable = can_act && !img.in_use;
+    ui.horizontal(|ui| {
+        let mut c = checked;
+        if ui
+            .add_enabled(selectable, egui::Checkbox::new(&mut c, ""))
+            .changed()
+        {
+            toggled = true;
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                RichText::new(human(img.size))
+                    .size(12.5)
+                    .monospace()
+                    .color(TEXT),
+            );
+            ui.add_space(8.0);
+            if img.in_use {
+                ui.label(RichText::new("in use").size(10.5).color(AMBER));
+                ui.add_space(6.0);
+            }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                let color = if img.in_use { MUTED } else { TEXT };
+                ui.add(
+                    egui::Label::new(RichText::new(&img.name).size(12.0).color(color)).truncate(),
+                );
             });
         });
     });

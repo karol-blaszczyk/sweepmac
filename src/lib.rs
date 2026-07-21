@@ -409,6 +409,16 @@ pub struct DockerVolume {
     pub in_use: bool,
 }
 
+/// A Docker image.
+pub struct DockerImage {
+    pub id: String,
+    /// "repo:tag" (or "<none>:<none>" for a dangling image).
+    pub name: String,
+    pub size: u64,
+    /// True if a container (any state) references it — can't be removed.
+    pub in_use: bool,
+}
+
 /// Granular Docker reclaimable breakdown for the detailed panel.
 #[derive(Default)]
 pub struct DockerInfo {
@@ -416,6 +426,7 @@ pub struct DockerInfo {
     pub images: u64,     // reclaimable (unused) images
     pub containers: u64, // reclaimable (stopped) containers
     pub volumes: Vec<DockerVolume>,
+    pub image_list: Vec<DockerImage>,
 }
 
 impl DockerInfo {
@@ -455,7 +466,87 @@ pub fn docker_info() -> Option<DockerInfo> {
         }
     }
     info.volumes = docker_volumes();
+    info.image_list = docker_images();
     Some(info)
+}
+
+/// List Docker images with sizes and best-effort in-use status.
+fn docker_images() -> Vec<DockerImage> {
+    let out = match Command::new("docker")
+        .args([
+            "images",
+            "--format",
+            "{{.ID}}|{{.Repository}}:{{.Tag}}|{{.Size}}",
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+
+    // Image references used by any container (running or stopped).
+    let used: Vec<String> = Command::new("docker")
+        .args(["ps", "-a", "--format", "{{.Image}}"])
+        .output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut images = Vec::new();
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split('|').collect();
+        if cols.len() < 3 {
+            continue;
+        }
+        let id = cols[0].trim().to_string();
+        let name = cols[1].trim().to_string();
+        let size = parse_docker_size(cols[2].trim()).unwrap_or(0);
+        // A container may reference an image by name or by (short) id.
+        let in_use = used
+            .iter()
+            .any(|u| u == &name || u == &id || u.starts_with(&id));
+        images.push(DockerImage {
+            id,
+            name,
+            size,
+            in_use,
+        });
+    }
+    images.sort_by(|a, b| b.size.cmp(&a.size));
+    images
+}
+
+/// Remove specific Docker images by id (no `-f`, so in-use images are refused).
+pub fn docker_image_rm(ids: &[String]) -> Result<String, String> {
+    if ids.is_empty() {
+        return Ok(String::new());
+    }
+    let mut args = vec!["rmi".to_string()];
+    args.extend(ids.iter().cloned());
+    let out = Command::new("docker")
+        .args(&args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    // rmi can partially succeed; return stdout+stderr either way.
+    let mut msg = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !err.is_empty() {
+        if !msg.is_empty() {
+            msg.push('\n');
+        }
+        msg.push_str(&err);
+    }
+    if out.status.success() {
+        Ok(msg)
+    } else {
+        Err(msg)
+    }
 }
 
 /// Per-volume name, size, and in-use status, parsed from `docker system df -v`.
