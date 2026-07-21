@@ -1348,9 +1348,21 @@ impl App {
                         .inner_margin(Margin::symmetric(10.0, 8.0))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            for name in names {
-                                ui.label(RichText::new(name).size(11.0).monospace().color(MUTED));
-                            }
+                            egui::ScrollArea::vertical()
+                                .max_height(160.0)
+                                .show(ui, |ui| {
+                                    for name in names {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(name)
+                                                    .size(11.0)
+                                                    .monospace()
+                                                    .color(MUTED),
+                                            )
+                                            .truncate(),
+                                        );
+                                    }
+                                });
                         });
                 }
                 // For image removal, list the image names.
