@@ -776,6 +776,8 @@ impl App {
                 let dimg_sel = self.dimg_selected.clone();
                 let mut dimg_toggles: Vec<String> = Vec::new();
                 let mut dimg_delete = false;
+                let mut dvol_set_all: Option<bool> = None;
+                let mut dimg_set_all: Option<bool> = None;
 
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     // Pseudo-terminal warning banner (only when near/at the cap).
@@ -877,13 +879,26 @@ impl App {
                                 .filter(|i| dimg_sel.contains(&i.id))
                                 .map(|i| i.size)
                                 .sum();
+                            let img_selectable =
+                                d.image_list.iter().filter(|i| !i.in_use).count();
+                            let img_all = img_selectable > 0 && isel_count == img_selectable;
                             ui.add_space(6.0);
-                            ui.label(
-                                RichText::new(format!("Images ({})", d.image_list.len()))
-                                    .size(11.0)
-                                    .strong()
-                                    .color(MUTED),
-                            );
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!("Images ({})", d.image_list.len()))
+                                        .size(11.0)
+                                        .strong()
+                                        .color(MUTED),
+                                );
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if img_selectable > 0 {
+                                        let lbl = if img_all { "Select none" } else { "Select all" };
+                                        if ui.add(ghost_button(lbl)).clicked() {
+                                            dimg_set_all = Some(!img_all);
+                                        }
+                                    }
+                                });
+                            });
                             card(ui, |ui| {
                                 for (n, img) in d.image_list.iter().enumerate() {
                                     if n > 0 {
@@ -926,13 +941,26 @@ impl App {
                                 .filter(|v| dvol_sel.contains(&v.name))
                                 .map(|v| v.size)
                                 .sum();
+                            let vol_selectable =
+                                d.volumes.iter().filter(|v| !v.in_use).count();
+                            let vol_all = vol_selectable > 0 && dsel_count == vol_selectable;
                             ui.add_space(6.0);
-                            ui.label(
-                                RichText::new("Volumes — contain data; deleting is permanent")
-                                    .size(11.0)
-                                    .strong()
-                                    .color(DANGER),
-                            );
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("Volumes — contain data; deleting is permanent")
+                                        .size(11.0)
+                                        .strong()
+                                        .color(DANGER),
+                                );
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if vol_selectable > 0 {
+                                        let lbl = if vol_all { "Select none" } else { "Select all" };
+                                        if ui.add(ghost_button(lbl)).clicked() {
+                                            dvol_set_all = Some(!vol_all);
+                                        }
+                                    }
+                                });
+                            });
                             card(ui, |ui| {
                                 for (n, v) in d.volumes.iter().enumerate() {
                                     if n > 0 {
@@ -1128,10 +1156,38 @@ impl App {
                     }
                 }
 
+                // Docker volume select-all/none (only unlockable, unused ones).
+                if let Some(all) = dvol_set_all {
+                    self.dvol_selected.clear();
+                    if all {
+                        if let Some(d) = &self.docker {
+                            self.dvol_selected = d
+                                .volumes
+                                .iter()
+                                .filter(|v| !v.in_use)
+                                .map(|v| v.name.clone())
+                                .collect();
+                        }
+                    }
+                }
+
                 // Apply Docker image selection changes.
                 for id in dimg_toggles {
                     if !self.dimg_selected.remove(&id) {
                         self.dimg_selected.insert(id);
+                    }
+                }
+                if let Some(all) = dimg_set_all {
+                    self.dimg_selected.clear();
+                    if all {
+                        if let Some(d) = &self.docker {
+                            self.dimg_selected = d
+                                .image_list
+                                .iter()
+                                .filter(|i| !i.in_use)
+                                .map(|i| i.id.clone())
+                                .collect();
+                        }
                     }
                 }
                 if dimg_delete {
