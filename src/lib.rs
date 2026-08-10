@@ -8,6 +8,48 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
+
+/// Directories where `docker` commonly lives but which GUI apps launched from
+/// Finder/Dock/Spotlight don't inherit (they get a minimal system PATH, not
+/// your shell's). We search these explicitly so the Docker panel isn't
+/// silently empty just because the app wasn't launched from a terminal.
+const EXTRA_BIN_DIRS: &[&str] = &[
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/sbin",
+];
+
+/// Resolve the `docker` binary once: prefer PATH, then fall back to common
+/// Homebrew/Intel install locations.
+pub fn docker_bin() -> &'static str {
+    static PATH: OnceLock<String> = OnceLock::new();
+    PATH.get_or_init(|| {
+        // If it's already runnable via the inherited PATH, use the bare name.
+        if Command::new("docker")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            return "docker".to_string();
+        }
+        for dir in EXTRA_BIN_DIRS {
+            let candidate = format!("{dir}/docker");
+            if Path::new(&candidate).is_file() {
+                return candidate;
+            }
+        }
+        "docker".to_string() // give up gracefully; callers already handle failure
+    })
+    .as_str()
+}
+
+/// Run a `docker` subcommand, resolving its path even when launched without a
+/// shell PATH (see `docker_bin`).
+fn docker_cmd() -> Command {
+    Command::new(docker_bin())
+}
 
 /// A directory we know how to clean.
 pub struct Target {
@@ -379,7 +421,7 @@ pub fn extras() -> Vec<(&'static str, PathBuf, u64)> {
 /// How much `docker builder/image prune -af` would reclaim inside the VM, in
 /// bytes (images + build cache). `None` if Docker isn't reachable.
 pub fn docker_reclaimable() -> Option<u64> {
-    let out = Command::new("docker")
+    let out = docker_cmd()
         .args(["system", "df", "--format", "{{.Type}}\t{{.Reclaimable}}"])
         .output()
         .ok()?;
@@ -443,7 +485,7 @@ impl DockerInfo {
 /// Gather a granular Docker breakdown (per-type reclaimable + per-volume).
 /// `None` if Docker isn't reachable.
 pub fn docker_info() -> Option<DockerInfo> {
-    let df = Command::new("docker")
+    let df = docker_cmd()
         .args(["system", "df", "--format", "{{.Type}}\t{{.Reclaimable}}"])
         .output()
         .ok()?;
@@ -472,7 +514,7 @@ pub fn docker_info() -> Option<DockerInfo> {
 
 /// List Docker images with sizes and best-effort in-use status.
 fn docker_images() -> Vec<DockerImage> {
-    let out = match Command::new("docker")
+    let out = match docker_cmd()
         .args([
             "images",
             "--format",
@@ -485,7 +527,7 @@ fn docker_images() -> Vec<DockerImage> {
     };
 
     // Image references used by any container (running or stopped).
-    let used: Vec<String> = Command::new("docker")
+    let used: Vec<String> = docker_cmd()
         .args(["ps", "-a", "--format", "{{.Image}}"])
         .output()
         .ok()
@@ -529,7 +571,7 @@ pub fn docker_image_rm(ids: &[String]) -> Result<String, String> {
     }
     let mut args = vec!["rmi".to_string()];
     args.extend(ids.iter().cloned());
-    let out = Command::new("docker")
+    let out = docker_cmd()
         .args(&args)
         .output()
         .map_err(|e| e.to_string())?;
@@ -551,7 +593,7 @@ pub fn docker_image_rm(ids: &[String]) -> Result<String, String> {
 
 /// Per-volume name, size, and in-use status, parsed from `docker system df -v`.
 fn docker_volumes() -> Vec<DockerVolume> {
-    let out = match Command::new("docker").args(["system", "df", "-v"]).output() {
+    let out = match docker_cmd().args(["system", "df", "-v"]).output() {
         Ok(o) if o.status.success() => o,
         _ => return Vec::new(),
     };
@@ -594,7 +636,7 @@ pub fn docker_prune_kind(kind: &str) -> Result<String, String> {
         "network" => &["network", "prune", "-f"],
         _ => return Err(format!("unknown prune kind: {kind}")),
     };
-    let out = Command::new("docker")
+    let out = docker_cmd()
         .args(args)
         .output()
         .map_err(|e| e.to_string())?;
@@ -612,7 +654,7 @@ pub fn docker_volume_rm(names: &[String]) -> Result<String, String> {
     }
     let mut args = vec!["volume".to_string(), "rm".to_string()];
     args.extend(names.iter().cloned());
-    let out = Command::new("docker")
+    let out = docker_cmd()
         .args(&args)
         .output()
         .map_err(|e| e.to_string())?;
@@ -645,7 +687,7 @@ fn parse_docker_size(s: &str) -> Option<u64> {
 pub fn run_docker_prune() -> String {
     let mut out = String::new();
     for args in [["builder", "prune", "-af"], ["image", "prune", "-af"]] {
-        match Command::new("docker").args(args).output() {
+        match docker_cmd().args(args).output() {
             Ok(o) if o.status.success() => {
                 out.push_str(&format!("docker {} ok\n", args.join(" ")));
             }

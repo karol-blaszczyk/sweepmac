@@ -405,7 +405,7 @@ impl App {
                     };
                     let _ = tx.send(Msg::Log(format!("$ docker {}", args.join(" "))));
                     ctx.request_repaint();
-                    stream(&tx, &ctx, "docker", args);
+                    stream(&tx, &ctx, sweepmac::docker_bin(), args);
                     let _ = tx.send(Msg::Cleaned { freed: 0 });
                     ctx.request_repaint();
                 });
@@ -416,7 +416,7 @@ impl App {
                     for name in &names {
                         let _ = tx.send(Msg::Log(format!("$ docker volume rm {name}")));
                         ctx.request_repaint();
-                        stream(&tx, &ctx, "docker", &["volume", "rm", name]);
+                        stream(&tx, &ctx, sweepmac::docker_bin(), &["volume", "rm", name]);
                     }
                     let _ = tx.send(Msg::Cleaned { freed: 0 });
                     ctx.request_repaint();
@@ -430,7 +430,7 @@ impl App {
                     let refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
                     let mut args = vec!["rmi"];
                     args.extend(refs);
-                    stream(&tx, &ctx, "docker", &args);
+                    stream(&tx, &ctx, sweepmac::docker_bin(), &args);
                     let _ = tx.send(Msg::Cleaned { freed: 0 });
                     ctx.request_repaint();
                 });
