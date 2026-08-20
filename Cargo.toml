@@ -3,6 +3,10 @@ name = "sweepmac"
 version = "0.1.0"
 edition = "2021"
 description = "Tiny macOS cleanup helper — finds and clears regenerable caches safely."
+license = "MIT"
+repository = "https://github.com/karol-blaszczyk/sweepmac"
+keywords = ["macos", "cache", "cleanup", "disk-space"]
+categories = ["command-line-utilities", "filesystem"]
 
 [lib]
 name = "sweepmac"

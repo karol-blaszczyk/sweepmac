@@ -1,12 +1,12 @@
 class Sweepmac < Formula
   desc "Find and clear regenerable macOS caches (CLI, GUI, and menu-bar app)"
   homepage "https://github.com/karol-blaszczyk/sweepmac"
-  # Private repo: fetched over ssh, so installers need GitHub access + an ssh key.
-  url "git@github.com:karol-blaszczyk/sweepmac.git",
+  url "https://github.com/karol-blaszczyk/sweepmac.git",
       using: :git,
       tag:   "v0.1.0"
   version "0.1.0"
-  head "git@github.com:karol-blaszczyk/sweepmac.git", using: :git, branch: "main"
+  license "MIT"
+  head "https://github.com/karol-blaszczyk/sweepmac.git", using: :git, branch: "main"
 
   depends_on "rust" => :build
   depends_on :macos

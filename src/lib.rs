@@ -68,7 +68,7 @@ pub struct Target {
 
 /// The catalogue of known-safe, regenerable caches.
 ///
-/// `dev`, `macos`, and `xcode` are cleaned by default. `app` caches re-download
+/// `DEFAULT_CLEAN_CATEGORIES` are cleaned by default. `app` caches re-download
 /// and are app-specific, so they are opt-in.
 pub const TARGETS: &[Target] = &[
     // --- System (logs + trash; conventionally safe to clear) ---
@@ -948,4 +948,120 @@ fn in_tri(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32, cx: f32, cy: f32
     let neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
     let pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
     !(neg && pos)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[test]
+    fn targets_are_sane() {
+        let mut seen = std::collections::HashSet::new();
+        for t in TARGETS {
+            assert!(seen.insert(t.id), "duplicate target id: {}", t.id);
+            assert!(
+                ALL_CATEGORIES.contains(&t.category),
+                "target {} has unknown category {}",
+                t.id,
+                t.category
+            );
+            // Paths must stay inside $HOME: relative, and no parent-dir escapes.
+            assert!(!t.rel.is_empty(), "target {} has empty path", t.id);
+            assert!(
+                !t.rel.starts_with('/') && !t.rel.starts_with('~'),
+                "target {} path must be relative to $HOME: {}",
+                t.id,
+                t.rel
+            );
+            assert!(
+                !t.rel.split('/').any(|c| c == ".."),
+                "target {} path escapes $HOME: {}",
+                t.id,
+                t.rel
+            );
+        }
+    }
+
+    #[test]
+    fn default_categories_are_a_subset_and_exclude_app() {
+        for c in DEFAULT_CLEAN_CATEGORIES {
+            assert!(ALL_CATEGORIES.contains(c));
+        }
+        assert!(!DEFAULT_CLEAN_CATEGORIES.contains(&"app"));
+    }
+
+    #[test]
+    fn target_by_id_roundtrips() {
+        for t in TARGETS {
+            assert_eq!(target_by_id(t.id).unwrap().id, t.id);
+        }
+        assert!(target_by_id("no-such-target").is_none());
+    }
+
+    #[test]
+    fn human_formats_sizes() {
+        assert_eq!(human(0), "0 B");
+        assert_eq!(human(512), "512 B");
+        assert_eq!(human(1024), "1.0 KB");
+        assert_eq!(human(1536), "1.5 KB");
+        assert_eq!(human(5 * 1024 * 1024), "5.0 MB");
+        assert_eq!(human(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let d = env::temp_dir().join(format!("sweepmac-test-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn clean_target_clear_contents_keeps_the_directory() {
+        let dir = scratch_dir("clear");
+        fs::write(dir.join("f.txt"), "x").unwrap();
+        fs::create_dir(dir.join("sub")).unwrap();
+        fs::write(dir.join("sub/g.txt"), "y").unwrap();
+
+        let t = Target {
+            id: "test",
+            category: "dev",
+            desc: "",
+            rel: "unused",
+            clear_contents: true,
+        };
+        clean_target(&t, &dir).unwrap();
+        assert!(dir.exists(), "directory itself must survive");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clean_target_remove_deletes_the_directory() {
+        let dir = scratch_dir("remove");
+        fs::write(dir.join("f.txt"), "x").unwrap();
+
+        let t = Target {
+            id: "test",
+            category: "dev",
+            desc: "",
+            rel: "unused",
+            clear_contents: false,
+        };
+        clean_target(&t, &dir).unwrap();
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn clean_target_missing_path_is_ok() {
+        let t = Target {
+            id: "test",
+            category: "dev",
+            desc: "",
+            rel: "unused",
+            clear_contents: false,
+        };
+        let missing = env::temp_dir().join("sweepmac-test-definitely-missing");
+        assert!(clean_target(&t, &missing).is_ok());
+    }
 }

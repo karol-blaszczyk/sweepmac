@@ -23,19 +23,35 @@ dependency-free.
 
 ## Install
 
-### Homebrew (recommended for teammates)
+### Homebrew (recommended)
 
 The repo doubles as a Homebrew tap ([Formula/sweepmac.rb](Formula/sweepmac.rb)).
 It builds from source on your machine, so there are no Gatekeeper warnings and
-no signing required — you just need GitHub access to this repo and an ssh key:
+no signing required:
 
 ```bash
-brew tap karol-blaszczyk/sweepmac git@github.com:karol-blaszczyk/sweepmac.git
+brew tap karol-blaszczyk/sweepmac https://github.com/karol-blaszczyk/sweepmac
 brew install sweepmac        # installs sweepmac, sweepmac-gui, sweepmac-tray
 ```
 
 Update later with `brew upgrade sweepmac` (or `brew install --HEAD sweepmac`
 to track `main`).
+
+### DMG
+
+Each [release](https://github.com/karol-blaszczyk/sweepmac/releases) attaches a
+`sweepmac.dmg` with a drag-to-install `sweepmac.app` (the menu-bar app, with the
+CLI and GUI binaries bundled inside). The DMG is **not signed or notarized**, so
+Gatekeeper will refuse to open it at first: allow it under
+**System Settings → Privacy & Security → "Open Anyway"**, or clear the
+quarantine flag:
+
+```bash
+xattr -d com.apple.quarantine /Applications/sweepmac.app
+```
+
+If that puts you off (fair!), use Homebrew — locally built binaries are never
+quarantined.
 
 ### From a checkout
 
@@ -76,20 +92,32 @@ sweepmac-gui
 
 A single window: caches grouped by category with checkboxes and sizes,
 default-safe categories pre-checked, app caches left unchecked. A running
-"Selected" total, checkboxes to also prune Docker / delete old simulators, and a
-red **Clean selected** button that asks for confirmation before deleting.
-Scanning and cleaning run on background threads so the window never freezes.
+"Selected" total and a red **Clean selected** button that asks for confirmation
+before deleting. Scanning and cleaning run on background threads so the window
+never freezes.
+
+Beyond the cache categories, the window also has:
+
+- **Docker panel** — per-image and per-volume lists with checkbox multi-select
+  delete (in-use images/volumes are locked), plus one-click build-cache prune.
+- **node_modules finder** — recursively finds `node_modules` folders under your
+  home directory (skipping Library, Trash, media folders), sorted by size, with
+  bulk delete.
+- **Extras** — iOS simulator cleanup and other space reported outside the cache
+  catalogue.
 
 ## Usage
 
 ```bash
 sweepmac                      # dry run: scan everything and report sizes
-sweepmac --clean              # clean default categories (macos, dev, xcode)
+sweepmac --clean              # clean default categories (system, macos, dev, xcode)
 sweepmac --clean --all        # also clean app caches (Brave/Spotify/Ableton — they re-download)
 sweepmac --clean -c dev,xcode # clean only the given categories
 sweepmac --clean --docker     # also: docker builder/image prune -af
 sweepmac --clean --simulators # also: xcrun simctl delete unavailable
 sweepmac --clean -y           # skip the confirmation prompt
+sweepmac fix-pty              # raise the macOS pty limit (fixes "out of pty devices")
+sweepmac fix-pty --persist    # …and make it survive reboots (/etc/sysctl.conf)
 sweepmac --help
 ```
 
@@ -97,13 +125,16 @@ sweepmac --help
 
 | Category | Targets |
 |----------|---------|
+| `system` | User logs + diagnostic reports (`~/Library/Logs`), Trash |
 | `macos`  | "Cleanup At Startup" temp staging |
-| `dev`    | Poetry, pip, Yarn, pnpm, Playwright, Homebrew caches |
-| `xcode`  | DerivedData (build cache) |
+| `dev`    | Poetry, pip, Yarn, pnpm, npm, Playwright, Homebrew, Gradle, Maven, Cargo, Go build, JetBrains caches |
+| `xcode`  | DerivedData (build cache), iOS DeviceSupport symbols |
 | `app`    | Brave, Spotify, Ableton caches *(opt-in — these re-download)* |
 
-`macos`, `dev`, and `xcode` are cleaned by default. `app` is opt-in via
-`--category app` or `--all`.
+`system`, `macos`, `dev`, and `xcode` are cleaned by default — note that
+includes **emptying the Trash**. `app` is opt-in via `--category app` or
+`--all`, and you can narrow any run with `-c` (e.g. `-c dev,xcode` to leave
+Trash and logs alone).
 
 ## Extras
 
@@ -119,8 +150,19 @@ their own tooling (they need it):
 > a fresh small VM. sweepmac intentionally does *not* automate this, since it
 > stops Docker.
 
+## Fixing "out of pty devices"
+
+Long macOS uptimes with heavy terminal/tmux/IDE use can exhaust the default
+pty limit. `sweepmac fix-pty` raises `kern.tty.ptmx_max` (prompts for an admin
+password via the native macOS dialog); `--persist` also writes it to
+`/etc/sysctl.conf` so it survives reboots.
+
 ## Adding a target
 
-Edit the `TARGETS` array in `src/main.rs` — each entry is a path relative to
-`$HOME`, a category, a description, and whether to clear the directory's
-contents or remove it entirely.
+Edit the `TARGETS` array in [src/lib.rs](src/lib.rs) — each entry is a path
+relative to `$HOME`, a category, a description, and whether to clear the
+directory's contents or remove it entirely.
+
+## License
+
+[MIT](LICENSE)
