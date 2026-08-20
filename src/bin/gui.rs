@@ -1037,7 +1037,9 @@ impl App {
                 // Deferred effects: collected while rendering, applied after.
                 let mut fx = Effects::default();
 
-                // Only a running operation blocks interaction; a background
+                // Only buttons that START work are gated while an operation
+                // runs — checkboxes stay live (a confirmed batch is snapshotted,
+                // so selection changes can't affect it), and a background
                 // rescan must not grey out the window.
                 let can_act = self.phase != Phase::Working;
 
@@ -1051,9 +1053,9 @@ impl App {
                             }
                         }
 
-                        self.recommended_section(ui, can_act, &mut fx);
+                        self.recommended_section(ui, &mut fx);
                         ui.add_space(style::SECTION_GAP);
-                        self.cache_groups(ui, can_act, &mut fx);
+                        self.cache_groups(ui, &mut fx);
                         ui.add_space(style::SECTION_GAP);
                         self.advanced_section(ui, can_act, &mut fx);
                         ui.add_space(style::SECTION_GAP);
@@ -1146,7 +1148,7 @@ impl App {
     }
 
     /// 3. Recommended cleanup — the automatically selected regenerable caches.
-    fn recommended_section(&self, ui: &mut egui::Ui, can_act: bool, fx: &mut Effects) {
+    fn recommended_section(&self, ui: &mut egui::Ui, fx: &mut Effects) {
         let t = self.tokens;
         let rec = self.recommended();
         ui.horizontal(|ui| {
@@ -1192,7 +1194,7 @@ impl App {
                         note: None,
                         size: r.size,
                         checked: true,
-                        enabled: can_act,
+                        enabled: true,
                         locked: false,
                         lock_note: None,
                         details: Some(&r.path.to_string_lossy()),
@@ -1224,7 +1226,7 @@ impl App {
     }
 
     /// 4. Cache groups — collapsed unless they hold something selected.
-    fn cache_groups(&self, ui: &mut egui::Ui, can_act: bool, fx: &mut Effects) {
+    fn cache_groups(&self, ui: &mut egui::Ui, fx: &mut Effects) {
         let t = self.tokens;
         let shown: HashSet<&str> = self
             .recommended()
@@ -1278,7 +1280,7 @@ impl App {
                                 note: None,
                                 size: r.size,
                                 checked: self.selected.contains(&cache_key(r.id)),
-                                enabled: can_act,
+                                enabled: true,
                                 locked: false,
                                 lock_note: None,
                                 details: Some(&r.path.to_string_lossy()),
@@ -1371,7 +1373,7 @@ impl App {
                                 note,
                                 size,
                                 checked: self.selected.contains(&key),
-                                enabled: can_act,
+                                enabled: true,
                                 locked: false,
                                 lock_note: None,
                                 details: None,
@@ -1431,7 +1433,7 @@ impl App {
                                     note: None,
                                     size: img.size,
                                     checked: self.img_selected.contains(&img.id),
-                                    enabled: can_act && !img.in_use,
+                                    enabled: !img.in_use,
                                     locked: img.in_use,
                                     lock_note: Some("in use"),
                                     details: Some(&img.id),
@@ -1521,7 +1523,7 @@ impl App {
                                 note: None,
                                 size: nm.size,
                                 checked: self.selected.contains(&key),
-                                enabled: can_act,
+                                enabled: true,
                                 locked: false,
                                 lock_note: None,
                                 details: Some(&nm.path.to_string_lossy()),
@@ -1566,7 +1568,7 @@ impl App {
                             ),
                             size: self.sims,
                             checked: self.selected.contains("sims"),
-                            enabled: can_act,
+                            enabled: true,
                             locked: false,
                             lock_note: None,
                             details: None,
@@ -1628,7 +1630,7 @@ impl App {
                             note: None,
                             size: v.size,
                             checked: self.vol_selected.contains(&v.name),
-                            enabled: can_act && !v.in_use,
+                            enabled: !v.in_use,
                             locked: v.in_use,
                             lock_note: Some("mounted"),
                             details: Some(&v.name),
