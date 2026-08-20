@@ -137,6 +137,8 @@ struct Review {
     estimate: u64,
     /// "Developer caches — 3 items · 2.1 GB" lines for the dialog.
     groups: Vec<(String, usize, u64)>,
+    /// Selection keys this batch consumes — deselected when it is confirmed.
+    keys: Vec<String>,
 }
 
 /// An irreversible action, confirmed on its own danger path.
@@ -221,7 +223,11 @@ struct App {
     started: Option<Instant>,
     last_scan: Option<Instant>,
 
+    /// Scan-result channel (Msg::Scanned only).
     rx: Option<Receiver<Msg>>,
+    /// Worker channel for jobs/danger/docker/pty (Log, Done, NmRemoved) — kept
+    /// separate from `rx` so starting work never discards an in-flight scan.
+    work_rx: Option<Receiver<Msg>>,
     nm_rx: Option<Receiver<Msg>>,
     docker_rx: Option<Receiver<Msg>>,
 }
@@ -257,6 +263,7 @@ impl App {
             started: None,
             last_scan: None,
             rx: None,
+            work_rx: None,
             nm_rx: None,
             docker_rx: None,
         };
@@ -348,7 +355,9 @@ impl App {
             ));
         }
         if self.sims > 0 {
-            items.push(Selectable::new("sims", self.sims, Risk::Conditional));
+            // Counted as an item but credited 0 bytes: the tree size is the
+            // whole CoreSimulator folder, not what `delete unavailable` frees.
+            items.push(Selectable::new("sims", 0, Risk::Conditional));
         }
         // Volumes are listed so bulk-selection filtering can *exclude* them.
         if let Some(d) = &self.docker {
@@ -374,10 +383,11 @@ impl App {
             .sum()
     }
 
-    /// Preselect the regenerable caches a scan found. Never touches anything
-    /// conditional or irreversible.
+    /// Preselect the regenerable caches a scan found. Re-derives only the
+    /// cache portion of the selection — Advanced ticks (docker/nm/sims) are the
+    /// user's own choices and survive a rescan.
     fn apply_recommended_selection(&mut self) {
-        self.selected.clear();
+        self.selected.retain(|k| !k.starts_with("cache:"));
         for r in self
             .rows
             .iter()
@@ -387,12 +397,18 @@ impl App {
         }
     }
 
-    /// The recommended rows, largest first.
+    /// The recommended rows, largest first. Only default-category caches
+    /// qualify — a manually ticked app cache stays in its own opt-in group
+    /// with its re-download warning, and is never presented as recommended.
     fn recommended(&self) -> Vec<&Row> {
         let mut v: Vec<&Row> = self
             .rows
             .iter()
-            .filter(|r| r.size > 0 && self.selected.contains(&cache_key(r.id)))
+            .filter(|r| {
+                r.size > 0
+                    && DEFAULT_CLEAN_CATEGORIES.contains(&r.category)
+                    && self.selected.contains(&cache_key(r.id))
+            })
             .collect();
         v.sort_by(|a, b| b.size.cmp(&a.size));
         v
@@ -410,6 +426,7 @@ impl App {
     fn build_review(&self) -> Option<Review> {
         let mut jobs: Vec<Job> = Vec::new();
         let mut groups: Vec<(String, usize, u64)> = Vec::new();
+        let mut keys: Vec<String> = Vec::new();
 
         // Caches, grouped for the dialog by their display group.
         for (label, cats) in GROUPS {
@@ -428,6 +445,7 @@ impl App {
             let bytes: u64 = picked.iter().map(|r| r.size).sum();
             groups.push((label.to_string(), picked.len(), bytes));
             for r in picked {
+                keys.push(cache_key(r.id));
                 jobs.push(Job::Cache {
                     id: r.id,
                     desc: r.desc.to_string(),
@@ -447,6 +465,7 @@ impl App {
                 let bytes: u64 = picked.iter().map(|(_, _, s)| *s).sum();
                 groups.push(("Docker".to_string(), picked.len(), bytes));
                 for (kind, label, _) in picked {
+                    keys.push(docker_key(kind));
                     jobs.push(Job::DockerPrune {
                         kind,
                         label: label.to_string(),
@@ -465,6 +484,7 @@ impl App {
             let bytes: u64 = nm.iter().map(|n| n.size).sum();
             groups.push(("node_modules".to_string(), nm.len(), bytes));
             for n in nm {
+                keys.push(nm_key(&n.path));
                 jobs.push(Job::NodeModules {
                     label: n.label.clone(),
                     path: n.path.clone(),
@@ -474,7 +494,9 @@ impl App {
         }
 
         if self.selected.contains("sims") && self.sims > 0 {
-            groups.push(("iOS simulators".to_string(), 1, self.sims));
+            // 0 bytes: only simctl knows how much of the tree is unavailable.
+            groups.push(("iOS simulators".to_string(), 1, 0));
+            keys.push("sims".to_string());
             jobs.push(Job::Simulators);
         }
 
@@ -486,6 +508,7 @@ impl App {
             jobs,
             estimate,
             groups,
+            keys,
         })
     }
 
@@ -496,7 +519,7 @@ impl App {
         self.started = Some(Instant::now());
         self.status = format!("Cleaning {} item{}…", jobs.len(), w::plural(jobs.len()));
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
-        self.rx = Some(rx);
+        self.work_rx = Some(rx);
         let ctx = self.ctx.clone();
         thread::spawn(move || {
             let mut freed = 0u64;
@@ -534,7 +557,9 @@ impl App {
                         };
                         let _ = tx.send(Msg::Log(format!("$ docker {} — {label}", args.join(" "))));
                         ctx.request_repaint();
-                        stream(&tx, &ctx, sweepmac::docker_bin(), args);
+                        if !stream(&tx, &ctx, sweepmac::docker_bin(), args) {
+                            failures += 1;
+                        }
                     }
                     Job::NodeModules { label, path, size } => {
                         let _ = tx.send(Msg::Log(format!("rm -rf {}", path.display())));
@@ -555,7 +580,9 @@ impl App {
                     Job::Simulators => {
                         let _ = tx.send(Msg::Log("$ xcrun simctl delete unavailable".into()));
                         ctx.request_repaint();
-                        stream(&tx, &ctx, "xcrun", &["simctl", "delete", "unavailable"]);
+                        if !stream(&tx, &ctx, "xcrun", &["simctl", "delete", "unavailable"]) {
+                            failures += 1;
+                        }
                     }
                 }
                 ctx.request_repaint();
@@ -595,7 +622,7 @@ impl App {
         self.log.clear();
         self.started = Some(Instant::now());
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
-        self.rx = Some(rx);
+        self.work_rx = Some(rx);
         let ctx = self.ctx.clone();
         match d {
             Danger::DockerVolumes { names, total } => {
@@ -609,7 +636,7 @@ impl App {
                     for name in &names {
                         let _ = tx.send(Msg::Log(format!("$ docker volume rm {name}")));
                         ctx.request_repaint();
-                        stream(&tx, &ctx, sweepmac::docker_bin(), &["volume", "rm", name]);
+                        let _ = stream(&tx, &ctx, sweepmac::docker_bin(), &["volume", "rm", name]);
                     }
                     let _ = tx.send(Msg::Done {
                         freed: 0,
@@ -632,26 +659,34 @@ impl App {
         self.log.clear();
         self.started = Some(Instant::now());
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
-        self.rx = Some(rx);
+        self.work_rx = Some(rx);
         let ctx = self.ctx.clone();
         match a {
             DockerAction::RemoveImages { ids, names, total } => {
-                self.status = format!("Removing {} image{}…", ids.len(), w::plural(ids.len()));
+                self.status = format!("Removing {} image{}…", names.len(), w::plural(names.len()));
                 thread::spawn(move || {
-                    let count = ids.len();
-                    let _ = tx.send(Msg::Log(format!("$ docker rmi {}", names.join(" "))));
+                    let count = names.len();
+                    let _ = tx.send(Msg::Log(format!("$ docker rmi {}", ids.join(" "))));
                     ctx.request_repaint();
                     let mut args = vec!["rmi"];
                     args.extend(ids.iter().map(|s| s.as_str()));
-                    stream(&tx, &ctx, sweepmac::docker_bin(), &args);
-                    let _ = tx.send(Msg::Done {
-                        freed: 0,
-                        ok: true,
-                        summary: format!(
+                    let ok = stream(&tx, &ctx, sweepmac::docker_bin(), &args);
+                    let summary = if ok {
+                        format!(
                             "Removed {count} image{} ({})",
                             w::plural(count),
                             human(total)
-                        ),
+                        )
+                    } else {
+                        format!(
+                            "Removing {count} image{} failed — view details",
+                            w::plural(count)
+                        )
+                    };
+                    let _ = tx.send(Msg::Done {
+                        freed: 0,
+                        ok,
+                        summary,
                         rescan: true,
                     });
                     ctx.request_repaint();
@@ -666,7 +701,7 @@ impl App {
         self.started = Some(Instant::now());
         self.status = "Waiting for your admin password…".into();
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
-        self.rx = Some(rx);
+        self.work_rx = Some(rx);
         let ctx = self.ctx.clone();
         thread::spawn(move || {
             let action = if persist {
@@ -742,6 +777,11 @@ impl App {
                 batch.push(msg);
             }
         }
+        if let Some(rx) = &self.work_rx {
+            while let Ok(msg) = rx.try_recv() {
+                batch.push(msg);
+            }
+        }
         for msg in batch {
             match msg {
                 Msg::Log(line) => {
@@ -761,11 +801,16 @@ impl App {
                     self.sims = sims;
                     self.disk = disk;
                     self.pty = pty;
-                    self.phase = Phase::Idle;
-                    self.started = None;
+                    // A worker may have started while this scan was in flight;
+                    // its Done, not the scan, ends the Working phase then.
+                    if self.phase == Phase::Scanning {
+                        self.phase = Phase::Idle;
+                        self.started = None;
+                        self.status =
+                            format!("{} safely reclaimable", human(self.safe_reclaimable()));
+                    }
                     self.last_scan = Some(Instant::now());
                     self.apply_recommended_selection();
-                    self.status = format!("{} safely reclaimable", human(self.safe_reclaimable()));
                     self.rx = None;
                     if std::mem::take(&mut self.review_on_open) {
                         self.review = self.build_review();
@@ -788,7 +833,7 @@ impl App {
                     } else {
                         "Done".into()
                     };
-                    self.rx = None;
+                    self.work_rx = None;
                     if rescan {
                         // Refresh totals and the selection from reality.
                         self.start_scan();
@@ -1066,7 +1111,9 @@ impl App {
                             .collect();
                         if !chosen.is_empty() {
                             self.docker_action = Some(DockerAction::RemoveImages {
-                                ids: chosen.iter().map(|i| i.id.clone()).collect(),
+                                // Refs, not raw ids: a multi-tagged image must
+                                // be untagged name by name (see rmi_refs).
+                                ids: chosen.iter().flat_map(|i| i.rmi_refs()).collect(),
                                 names: chosen.iter().map(|i| i.name.clone()).collect(),
                                 total: chosen.iter().map(|i| i.size).sum(),
                             });
@@ -1146,6 +1193,7 @@ impl App {
                         size: r.size,
                         checked: true,
                         enabled: can_act,
+                        locked: false,
                         lock_note: None,
                         details: Some(&r.path.to_string_lossy()),
                         tint: t.accent,
@@ -1231,6 +1279,7 @@ impl App {
                                 size: r.size,
                                 checked: self.selected.contains(&cache_key(r.id)),
                                 enabled: can_act,
+                                locked: false,
                                 lock_note: None,
                                 details: Some(&r.path.to_string_lossy()),
                                 tint: t.accent,
@@ -1323,6 +1372,7 @@ impl App {
                                 size,
                                 checked: self.selected.contains(&key),
                                 enabled: can_act,
+                                locked: false,
                                 lock_note: None,
                                 details: None,
                                 tint: t.caution,
@@ -1382,6 +1432,7 @@ impl App {
                                     size: img.size,
                                     checked: self.img_selected.contains(&img.id),
                                     enabled: can_act && !img.in_use,
+                                    locked: img.in_use,
                                     lock_note: Some("in use"),
                                     details: Some(&img.id),
                                     tint: t.caution,
@@ -1471,6 +1522,7 @@ impl App {
                                 size: nm.size,
                                 checked: self.selected.contains(&key),
                                 enabled: can_act,
+                                locked: false,
                                 lock_note: None,
                                 details: Some(&nm.path.to_string_lossy()),
                                 tint: t.caution,
@@ -1506,11 +1558,16 @@ impl App {
                         ui,
                         &t,
                         RowView {
-                            name: "Unavailable simulator runtimes",
-                            note: Some("Removed with xcrun simctl delete unavailable"),
+                            name: "iOS simulators (CoreSimulator)",
+                            note: Some(
+                                "Size is the whole simulator folder; cleaning deletes only \
+                                 unavailable runtimes (xcrun simctl delete unavailable) — \
+                                 usually a fraction of it",
+                            ),
                             size: self.sims,
                             checked: self.selected.contains("sims"),
                             enabled: can_act,
+                            locked: false,
                             lock_note: None,
                             details: None,
                             tint: t.caution,
@@ -1572,6 +1629,7 @@ impl App {
                             size: v.size,
                             checked: self.vol_selected.contains(&v.name),
                             enabled: can_act && !v.in_use,
+                            locked: v.in_use,
                             lock_note: Some("mounted"),
                             details: Some(&v.name),
                             tint: t.danger,
@@ -1697,12 +1755,18 @@ impl App {
             )
             .show(ctx, |ui| {
                 ui.set_max_width(390.0);
-                ui.label(
-                    RichText::new(format!("{} to reclaim", human(review.estimate)))
-                        .size(22.0)
-                        .strong()
-                        .color(t.safe),
-                );
+                // Headline what the dialog's own group rows add up to. Docker
+                // reports its exact reclaim only when pruning, so a batch that
+                // includes it is an upper bound, not a measurement.
+                let promised: u64 = review.groups.iter().map(|(_, _, b)| *b).sum();
+                let headline = if promised == 0 {
+                    "Size reported after cleanup".to_string()
+                } else if promised > review.estimate {
+                    format!("Up to {} to reclaim", human(promised))
+                } else {
+                    format!("{} to reclaim", human(promised))
+                };
+                ui.label(RichText::new(headline).size(22.0).strong().color(t.safe));
                 ui.add_space(10.0);
                 for (label, count, bytes) in &review.groups {
                     ui.horizontal(|ui| {
@@ -1728,14 +1792,25 @@ impl App {
                     .collect();
                 w::item_manifest(ui, &t, &lines);
                 ui.add_space(10.0);
+                // node_modules folders live inside the user's projects, so the
+                // blanket "no projects are touched" claim must not cover them.
+                let has_nm = review
+                    .jobs
+                    .iter()
+                    .any(|j| matches!(j, Job::NodeModules { .. }));
+                let note = if has_nm {
+                    "Caches are regenerable: your tools rebuild them when next needed. The \
+                     selected node_modules folders are deleted permanently from inside your \
+                     project directories — rebuild each project with npm / yarn / pnpm install."
+                } else {
+                    "These are regenerable caches: your tools rebuild them the next time they \
+                     need them, so they may reappear later. No documents, projects or Git \
+                     repositories are touched."
+                };
                 ui.label(
-                    RichText::new(
-                        "These are regenerable caches: your tools rebuild them the next time they \
-                         need them, so they may reappear later. No documents, projects or Git \
-                         repositories are touched.",
-                    )
-                    .size(style::T_META)
-                    .color(t.text_secondary),
+                    RichText::new(note)
+                        .size(style::T_META)
+                        .color(t.text_secondary),
                 );
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
@@ -1743,8 +1818,10 @@ impl App {
                         cancel = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let label = if review.estimate > 0 {
-                            format!("Clean {}", human(review.estimate))
+                        let label = if promised > review.estimate {
+                            format!("Clean up to {}", human(promised))
+                        } else if promised > 0 {
+                            format!("Clean {}", human(promised))
                         } else {
                             "Clean selected".to_string()
                         };
@@ -1757,6 +1834,11 @@ impl App {
 
         if confirm {
             self.review = None;
+            // The batch consumes its selection: once these run, they must not
+            // stay ticked into the next scan.
+            for key in &review.keys {
+                self.selected.remove(key);
+            }
             self.run_jobs(review.jobs, review.estimate);
         } else if cancel {
             self.review = None;
@@ -1917,8 +1999,9 @@ impl App {
 }
 
 /// Run an external command, forwarding each stdout/stderr line to the UI so
-/// progress is visible live. Blocks until the command exits.
-fn stream(tx: &Sender<Msg>, ctx: &egui::Context, prog: &str, args: &[&str]) {
+/// progress is visible live. Blocks until the command exits; returns whether
+/// it ran and exited successfully.
+fn stream(tx: &Sender<Msg>, ctx: &egui::Context, prog: &str, args: &[&str]) -> bool {
     let mut child = match Command::new(prog)
         .args(args)
         .stdout(Stdio::piped())
@@ -1929,7 +2012,7 @@ fn stream(tx: &Sender<Msg>, ctx: &egui::Context, prog: &str, args: &[&str]) {
         Err(e) => {
             let _ = tx.send(Msg::Log(format!("could not run {prog}: {e}")));
             ctx.request_repaint();
-            return;
+            return false;
         }
     };
     if let Some(out) = child.stdout.take() {
@@ -1944,5 +2027,5 @@ fn stream(tx: &Sender<Msg>, ctx: &egui::Context, prog: &str, args: &[&str]) {
             ctx.request_repaint();
         }
     }
-    let _ = child.wait();
+    child.wait().map(|s| s.success()).unwrap_or(false)
 }

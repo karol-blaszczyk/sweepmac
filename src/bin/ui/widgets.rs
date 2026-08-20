@@ -254,9 +254,12 @@ pub struct RowView<'a> {
     pub note: Option<&'a str>,
     pub size: u64,
     pub checked: bool,
-    /// False when the item can't be acted on right now.
+    /// False when the item can't be acted on right now (e.g. work in flight).
     pub enabled: bool,
-    /// Why it can't be selected ("in use by a container").
+    /// True when the item ITSELF is locked (in use / mounted) — drives the
+    /// lock pill, independently of transient `enabled` gating.
+    pub locked: bool,
+    /// Why it is locked ("in use by a container").
     pub lock_note: Option<&'a str>,
     /// Technical detail shown on hover (path, image id…).
     pub details: Option<&'a str>,
@@ -278,7 +281,7 @@ pub fn select_row(ui: &mut egui::Ui, t: &Tokens, v: RowView<'_>) -> bool {
             toggled = true;
         }
         if let Some(why) = v.lock_note {
-            if !v.enabled {
+            if v.locked {
                 cb = cb.on_disabled_hover_text(why);
             }
         }
@@ -296,7 +299,7 @@ pub fn select_row(ui: &mut egui::Ui, t: &Tokens, v: RowView<'_>) -> bool {
                     name.on_hover_text(RichText::new(d).size(style::T_META).monospace());
                 }
                 if let Some(lock) = v.lock_note {
-                    if !v.enabled {
+                    if v.locked {
                         ui.add_space(4.0);
                         status_pill(ui, t, lock, t.caution);
                     }

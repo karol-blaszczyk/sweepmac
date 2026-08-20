@@ -550,14 +550,35 @@ pub struct DockerVolume {
     pub in_use: bool,
 }
 
-/// A Docker image.
+/// A Docker image. One entry per image *id* — `docker images` prints one line
+/// per tag, and a multi-tagged image must not be listed (or sized) twice.
 pub struct DockerImage {
     pub id: String,
-    /// "repo:tag" (or "<none>:<none>" for a dangling image).
+    /// Display name: the tags joined with ", " (or "<none>:<none>" dangling).
     pub name: String,
+    /// Every "repo:tag" that references this id.
+    pub tags: Vec<String>,
     pub size: u64,
     /// True if a container (any state) references it — can't be removed.
     pub in_use: bool,
+}
+
+impl DockerImage {
+    /// Arguments for `docker rmi` that actually delete this image: a
+    /// multi-tagged image must be untagged name by name (removal by id is
+    /// refused without -f), a single-tag or dangling one goes by id.
+    pub fn rmi_refs(&self) -> Vec<String> {
+        let real_tags: Vec<&String> = self
+            .tags
+            .iter()
+            .filter(|t| !t.starts_with("<none>"))
+            .collect();
+        if real_tags.len() > 1 {
+            real_tags.into_iter().cloned().collect()
+        } else {
+            vec![self.id.clone()]
+        }
+    }
 }
 
 /// Granular Docker reclaimable breakdown for the detailed panel.
@@ -639,25 +660,34 @@ fn docker_images() -> Vec<DockerImage> {
         .unwrap_or_default();
 
     let text = String::from_utf8_lossy(&out.stdout);
-    let mut images = Vec::new();
+    let mut images: Vec<DockerImage> = Vec::new();
     for line in text.lines() {
         let cols: Vec<&str> = line.split('|').collect();
         if cols.len() < 3 {
             continue;
         }
         let id = cols[0].trim().to_string();
-        let name = cols[1].trim().to_string();
+        let tag = cols[1].trim().to_string();
         let size = parse_docker_size(cols[2].trim()).unwrap_or(0);
         // A container may reference an image by name or by (short) id.
         let in_use = used
             .iter()
-            .any(|u| u == &name || u == &id || u.starts_with(&id));
-        images.push(DockerImage {
-            id,
-            name,
-            size,
-            in_use,
-        });
+            .any(|u| u == &tag || u == &id || u.starts_with(&id));
+        // `docker images` emits one line per tag with the same id and the same
+        // size — fold tags of one image into a single entry.
+        if let Some(existing) = images.iter_mut().find(|i| i.id == id) {
+            existing.tags.push(tag);
+            existing.name = existing.tags.join(", ");
+            existing.in_use |= in_use;
+        } else {
+            images.push(DockerImage {
+                id,
+                name: tag.clone(),
+                tags: vec![tag],
+                size,
+                in_use,
+            });
+        }
     }
     images.sort_by(|a, b| b.size.cmp(&a.size));
     images
@@ -1376,6 +1406,36 @@ mod tests {
                 assert_eq!((p[0], p[1], p[2]), (255, 255, 255));
             }
         }
+    }
+
+    #[test]
+    fn rmi_refs_untag_multi_tagged_images_by_name() {
+        let multi = DockerImage {
+            id: "abc123".into(),
+            name: "node:20, node:latest".into(),
+            tags: vec!["node:20".into(), "node:latest".into()],
+            size: 1,
+            in_use: false,
+        };
+        assert_eq!(multi.rmi_refs(), vec!["node:20", "node:latest"]);
+
+        let single = DockerImage {
+            id: "def456".into(),
+            name: "redis:7".into(),
+            tags: vec!["redis:7".into()],
+            size: 1,
+            in_use: false,
+        };
+        assert_eq!(single.rmi_refs(), vec!["def456"]);
+
+        let dangling = DockerImage {
+            id: "ffff00".into(),
+            name: "<none>:<none>".into(),
+            tags: vec!["<none>:<none>".into()],
+            size: 1,
+            in_use: false,
+        };
+        assert_eq!(dangling.rmi_refs(), vec!["ffff00"]);
     }
 
     /// The bundled template assets must decode at every scale the tray asks
