@@ -207,7 +207,7 @@ pub fn group<R>(ui: &mut egui::Ui, t: &Tokens, add: impl FnOnce(&mut egui::Ui) -
         .rounding(Rounding::same(RADIUS))
         .inner_margin(Margin::symmetric(GROUP_PAD_X, GROUP_PAD_Y))
         .show(ui, |ui| {
-            ui.set_width(ui.available_width() - GROUP_PAD_X * 2.0);
+            ui.set_width(ui.available_width());
             add(ui)
         })
         .inner
@@ -227,7 +227,7 @@ pub fn tinted_group<R>(
         .inner_margin(Margin::symmetric(GROUP_PAD_X, GROUP_PAD_Y))
         .stroke(Stroke::new(1.0, tint.gamma_multiply(0.45)))
         .show(ui, |ui| {
-            ui.set_width(ui.available_width() - GROUP_PAD_X * 2.0);
+            ui.set_width(ui.available_width());
             add(ui)
         })
         .inner

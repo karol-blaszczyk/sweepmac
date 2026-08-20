@@ -267,28 +267,110 @@ pub struct RowView<'a> {
     pub tint: Color32,
 }
 
+/// The selection control: a box that fills solid with the row's risk tint and
+/// draws a bold checkmark when ticked, so checked state is legible at a glance
+/// (egui's stock checkbox only changes a thin checkmark). Returns true when
+/// toggled; participates in keyboard focus (tab + space/enter).
+pub fn risk_checkbox(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    checked: bool,
+    enabled: bool,
+    tint: Color32,
+) -> egui::Response {
+    let side = 18.0;
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(side, side), sense);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, checked, "")
+    });
+
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        let rounding = Rounding::same(5.0);
+        let rect = rect.shrink(1.0);
+        if checked {
+            let fill = if enabled {
+                tint
+            } else {
+                tint.gamma_multiply(0.45)
+            };
+            p.rect_filled(rect, rounding, fill);
+            // Bold checkmark in the on-fill colour.
+            let c = rect.center();
+            let mark = Stroke::new(2.2, t.on_accent);
+            p.line_segment(
+                [
+                    egui::pos2(c.x - 4.5, c.y + 0.5),
+                    egui::pos2(c.x - 1.0, c.y + 4.0),
+                ],
+                mark,
+            );
+            p.line_segment(
+                [
+                    egui::pos2(c.x - 1.0, c.y + 4.0),
+                    egui::pos2(c.x + 4.8, c.y - 3.8),
+                ],
+                mark,
+            );
+        } else {
+            let edge = if enabled { t.text_muted } else { t.divider };
+            p.rect_stroke(rect, rounding, Stroke::new(1.5, edge));
+        }
+        if response.hovered() || response.has_focus() {
+            p.rect_stroke(
+                rect.expand(2.0),
+                Rounding::same(7.0),
+                Stroke::new(1.5, t.accent),
+            );
+        }
+    }
+    response
+}
+
 /// Draw a row with a selection control, name, size and optional detail. Returns
 /// true when the selection was toggled.
+///
+/// Layout note: the right-aligned size (and lock pill) are laid out FIRST in a
+/// right-to-left pass, and the name truncates into whatever width remains — so
+/// a long volume hash or node_modules path can never paint underneath them.
 pub fn select_row(ui: &mut egui::Ui, t: &Tokens, v: RowView<'_>) -> bool {
     let mut toggled = false;
     ui.horizontal(|ui| {
-        let mut checked = v.checked;
-        let mut cb = ui.add_enabled(
-            v.enabled,
-            egui::Checkbox::new(&mut checked, "").indeterminate(false),
-        );
-        if cb.changed() {
+        let mut cb = risk_checkbox(ui, t, v.checked, v.enabled, v.tint);
+        if cb.clicked() {
             toggled = true;
         }
         if let Some(why) = v.lock_note {
             if v.locked {
-                cb = cb.on_disabled_hover_text(why);
+                cb = cb.on_hover_text(why);
             }
         }
         let _ = cb;
 
-        ui.vertical(|ui| {
-            ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let size_color = if v.size > 0 { t.text } else { t.text_muted };
+            ui.label(
+                RichText::new(if v.size > 0 {
+                    human(v.size)
+                } else {
+                    "empty".to_string()
+                })
+                .size(style::T_LABEL)
+                .color(size_color),
+            );
+            if let Some(lock) = v.lock_note {
+                if v.locked {
+                    ui.add_space(4.0);
+                    status_pill(ui, t, lock, t.caution);
+                }
+            }
+            // The name takes the remaining width and truncates within it.
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 let name_color = if v.enabled { t.text } else { t.text_muted };
                 let name = ui.add(
                     egui::Label::new(RichText::new(v.name).size(style::T_BODY).color(name_color))
@@ -298,31 +380,15 @@ pub fn select_row(ui: &mut egui::Ui, t: &Tokens, v: RowView<'_>) -> bool {
                 if let Some(d) = v.details {
                     name.on_hover_text(RichText::new(d).size(style::T_META).monospace());
                 }
-                if let Some(lock) = v.lock_note {
-                    if v.locked {
-                        ui.add_space(4.0);
-                        status_pill(ui, t, lock, t.caution);
-                    }
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let size_color = if v.size > 0 { t.text } else { t.text_muted };
-                    ui.label(
-                        RichText::new(if v.size > 0 {
-                            human(v.size)
-                        } else {
-                            "empty".to_string()
-                        })
-                        .size(style::T_LABEL)
-                        .color(size_color),
-                    );
-                });
             });
-            if let Some(note) = v.note {
-                ui.label(style::meta(t, note));
-            }
         });
-        let _ = v.tint;
     });
+    if let Some(note) = v.note {
+        ui.horizontal(|ui| {
+            ui.add_space(26.0); // align under the name, past the checkbox
+            ui.label(style::meta(t, note));
+        });
+    }
     toggled
 }
 
@@ -502,7 +568,7 @@ pub fn item_manifest(ui: &mut egui::Ui, t: &Tokens, lines: &[(String, Option<u64
         .inner_margin(egui::Margin::symmetric(10.0, 8.0))
         .stroke(Stroke::new(1.0, t.divider))
         .show(ui, |ui| {
-            ui.set_width(ui.available_width() - 20.0);
+            ui.set_width(ui.available_width());
             egui::ScrollArea::vertical()
                 .max_height(150.0)
                 .auto_shrink([false, true])
