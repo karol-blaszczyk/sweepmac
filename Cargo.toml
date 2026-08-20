@@ -35,9 +35,12 @@ required-features = ["pkg"]
 # The CLI has zero dependencies. The GUI and menu-bar tray are opt-in via these
 # features so a plain `cargo build` / `cargo install` stays tiny and fast.
 # `pkg` is only used by the packaging script to emit the .icns source PNG.
-gui = ["dep:eframe"]
-tray = ["dep:tray-icon", "dep:tao"]
-pkg = ["dep:png"]
+gui = ["dep:eframe", "icons"]
+tray = ["dep:tray-icon", "dep:tao", "icons"]
+pkg = ["icons"]
+# Internal: PNG decode/encode for the bundled icon assets. Not meant to be
+# enabled on its own — `gui`, `tray` and `pkg` pull it in as needed.
+icons = ["dep:png"]
 
 [dependencies]
 eframe = { version = "0.29", optional = true }

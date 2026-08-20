@@ -267,6 +267,105 @@ pub fn target_by_id(id: &str) -> Option<&'static Target> {
     TARGETS.iter().find(|t| t.id == id)
 }
 
+// --- Selection model -----------------------------------------------------
+//
+// Pure, dependency-free selection arithmetic shared by the front-ends. The GUI
+// owns the widgets; the rules about *what may be selected in bulk* and *when an
+// action may run* live here so they can be tested without a window.
+
+/// How dangerous cleaning an item is. Drives selection defaults and the colour
+/// / confirmation path a front-end must use.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Risk {
+    /// A regenerable cache: rebuilding it costs time, never data. Safe to
+    /// preselect and to clean behind the ordinary review step.
+    Regenerable,
+    /// Developer state that is safe in most setups but worth a deliberate
+    /// choice (Docker build cache, unused images, node_modules).
+    Conditional,
+    /// Removes data that cannot be regenerated (Docker volumes). Never bulk
+    /// selected, always confirmed on its own danger path.
+    Irreversible,
+}
+
+impl Risk {
+    /// True when an item of this risk may be included by a "select all".
+    pub fn bulk_selectable(self) -> bool {
+        !matches!(self, Risk::Irreversible)
+    }
+}
+
+/// One selectable line item, reduced to what the selection rules need.
+#[derive(Clone, Debug)]
+pub struct Selectable {
+    /// Stable identity (target id, image id, volume name, path…).
+    pub key: String,
+    pub bytes: u64,
+    pub risk: Risk,
+    /// True when the item exists but cannot be acted on (e.g. an in-use Docker
+    /// image). Locked items are never selectable.
+    pub locked: bool,
+}
+
+impl Selectable {
+    pub fn new(key: impl Into<String>, bytes: u64, risk: Risk) -> Self {
+        Selectable {
+            key: key.into(),
+            bytes,
+            risk,
+            locked: false,
+        }
+    }
+
+    pub fn locked(mut self, locked: bool) -> Self {
+        self.locked = locked;
+        self
+    }
+}
+
+/// Aggregate of the current selection, as shown in the action bar.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct SelectionSummary {
+    pub count: usize,
+    pub bytes: u64,
+}
+
+impl SelectionSummary {
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
+
+/// Total the items `is_selected` says are selected. Locked items never count,
+/// even if a stale key lingers in the selection set.
+pub fn summarize(items: &[Selectable], is_selected: impl Fn(&str) -> bool) -> SelectionSummary {
+    items
+        .iter()
+        .filter(|i| !i.locked && is_selected(&i.key))
+        .fold(SelectionSummary::default(), |mut acc, i| {
+            acc.count += 1;
+            acc.bytes += i.bytes;
+            acc
+        })
+}
+
+/// The keys a "select all" may legitimately tick: everything unlocked whose
+/// risk allows bulk selection. Irreversible items are deliberately excluded —
+/// destroying data must always be an individual, explicit choice.
+pub fn bulk_selectable_keys(items: &[Selectable]) -> Vec<String> {
+    items
+        .iter()
+        .filter(|i| !i.locked && i.risk.bulk_selectable())
+        .map(|i| i.key.clone())
+        .collect()
+}
+
+/// Whether the primary action may run: something is selected and no other
+/// operation is in flight.
+pub fn action_enabled(summary: SelectionSummary, busy: bool) -> bool {
+    !summary.is_empty() && !busy
+}
+
 /// A discovered `node_modules` directory.
 pub struct NodeModules {
     pub path: PathBuf,
@@ -847,18 +946,82 @@ pub fn human(bytes: u64) -> String {
     }
 }
 
+// --- Icon assets ---------------------------------------------------------
+
+/// The designed menu-bar template glyph — a geometric broom with one sparkle —
+/// as a black-on-transparent alpha mask, at 1x / 2x / 3x of the nominal 18 pt
+/// status-item slot. macOS tints the mask itself, so only the alpha matters.
+///
+/// `assets/tray/tray-template.svg` is the master these were exported from.
+#[cfg(feature = "icons")]
+const TRAY_TEMPLATE_PNGS: &[(u32, &[u8])] = &[
+    (18, include_bytes!("../assets/tray/tray-template-18.png")),
+    (36, include_bytes!("../assets/tray/tray-template-18@2x.png")),
+    (54, include_bytes!("../assets/tray/tray-template-18@3x.png")),
+];
+
+/// Decode a PNG to straight-alpha RGBA. `None` if it can't be read.
+#[cfg(feature = "icons")]
+pub fn decode_png_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let decoder = png::Decoder::new(bytes);
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    buf.truncate(info.buffer_size());
+    let (w, h) = (info.width, info.height);
+    // Normalise to 8-bit RGBA; the bundled assets are already RGBA8.
+    let rgba = match (info.color_type, info.bit_depth) {
+        (png::ColorType::Rgba, png::BitDepth::Eight) => buf,
+        (png::ColorType::Rgb, png::BitDepth::Eight) => buf
+            .chunks(3)
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect(),
+        (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight) => buf
+            .chunks(2)
+            .flat_map(|p| [p[0], p[0], p[0], p[1]])
+            .collect(),
+        (png::ColorType::Grayscale, png::BitDepth::Eight) => {
+            buf.iter().flat_map(|v| [*v, *v, *v, 255]).collect()
+        }
+        _ => return None,
+    };
+    Some((rgba, w, h))
+}
+
+/// The menu-bar template mask at the requested pixel size, as straight-alpha
+/// RGBA. Falls back to the procedural [`broom_rgba`] glyph if the bundled asset
+/// can't be decoded, so the status item is never left without a mark.
+#[cfg(feature = "icons")]
+pub fn tray_template_rgba(px: u32) -> (Vec<u8>, u32) {
+    if let Some((_, bytes)) = TRAY_TEMPLATE_PNGS.iter().find(|(size, _)| *size == px) {
+        if let Some((rgba, w, h)) = decode_png_rgba(bytes) {
+            if w == h {
+                return (rgba, w);
+            }
+        }
+    }
+    (broom_rgba(px, true), px)
+}
+
 // --- Icon generation -----------------------------------------------------
 
 /// Render a broom icon as straight-alpha RGBA, `size`×`size`.
 ///
-/// `template = true` → white glyph on transparent (a macOS menu-bar template
-/// image; the system tints it white/black to match the bar). `template = false`
-/// → a white broom on a rounded accent-blue tile, for the app / window icon.
+/// `template = true` → a flat white glyph on transparent (the fallback macOS
+/// menu-bar template image; the system tints it to match the bar).
+/// `template = false` → the colour app/window icon: a graphite-navy rounded
+/// tile, pale birch handle, teal brush head and one white sparkle. No
+/// typography, no gradients.
 pub fn broom_rgba(size: u32, template: bool) -> Vec<u8> {
     let n = size as usize;
     let mut buf = vec![0u8; n * n * 4];
     const SS: usize = 3; // supersampling for smooth edges
-    let accent = (0x4cu32, 0x8du32, 0xffu32);
+
+    // App-icon palette.
+    const TILE: (u32, u32, u32) = (0x1E, 0x25, 0x33); // graphite navy
+    const HANDLE: (u32, u32, u32) = (0xE8, 0xD9, 0xBE); // pale birch
+    const HEAD: (u32, u32, u32) = (0x3F, 0xC1, 0xA9); // teal
+    const SPARKLE: (u32, u32, u32) = (0xFF, 0xFF, 0xFF);
 
     for y in 0..n {
         for x in 0..n {
@@ -867,15 +1030,21 @@ pub fn broom_rgba(size: u32, template: bool) -> Vec<u8> {
                 for sx in 0..SS {
                     let fx = (x as f32 + (sx as f32 + 0.5) / SS as f32) / n as f32;
                     let fy = (y as f32 + (sy as f32 + 0.5) / SS as f32) / n as f32;
-                    if in_broom(fx, fy) {
-                        cr += 255;
-                        cg += 255;
-                        cb += 255;
-                        cov += 1;
-                    } else if !template && in_tile(fx, fy) {
-                        cr += accent.0;
-                        cg += accent.1;
-                        cb += accent.2;
+                    let part = broom_part(fx, fy);
+                    let color = match (template, part) {
+                        // Template: one flat mask, whatever the part.
+                        (true, Some(_)) => Some(SPARKLE),
+                        (true, None) => None,
+                        (false, Some(Part::Handle)) => Some(HANDLE),
+                        (false, Some(Part::Head)) => Some(HEAD),
+                        (false, Some(Part::Sparkle)) => Some(SPARKLE),
+                        (false, None) if in_tile(fx, fy) => Some(TILE),
+                        (false, None) => None,
+                    };
+                    if let Some((r, g, b)) = color {
+                        cr += r;
+                        cg += g;
+                        cb += b;
                         cov += 1;
                     }
                 }
@@ -904,25 +1073,59 @@ fn in_tile(x: f32, y: f32) -> bool {
     (qx * qx + qy * qy).sqrt() <= r
 }
 
-/// Broom glyph: a slanted handle plus a trapezoidal brush head with bristle
-/// notches along the bottom.
-fn in_broom(x: f32, y: f32) -> bool {
-    let handle = seg_dist(x, y, 0.72, 0.14, 0.45, 0.52) <= 0.045;
-    let tl = (0.30, 0.50);
-    let tr = (0.52, 0.50);
-    let br = (0.66, 0.88);
-    let bl = (0.16, 0.88);
+/// Which part of the mark a point falls in — lets the colour icon paint the
+/// handle, head and sparkle separately while the template stays a flat mask.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Part {
+    Handle,
+    Head,
+    Sparkle,
+}
+
+/// Broom glyph: a diagonal sweep — thick handle running lower-left to
+/// upper-right, a wide brush head, and a four-point sparkle in the upper-right.
+///
+/// Tuned to stay legible as one connected mark at 16–18 px: the handle is
+/// deliberately heavy (no hairlines), the head is a solid wedge, and bristle
+/// notches only appear in the lower third where there is room for them. The
+/// sparkle is detached by design — at 18 px it reads as a deliberate accent
+/// rather than a broken-off fragment.
+fn broom_part(x: f32, y: f32) -> Option<Part> {
+    // Sparkle: a compact four-point star, upper-right.
+    if in_sparkle(x, y, 0.80, 0.20, 0.13) {
+        return Some(Part::Sparkle);
+    }
+
+    // Brush head: a solid wedge at the lower-left end of the handle.
+    let tl = (0.10, 0.60);
+    let tr = (0.42, 0.50);
+    let br = (0.50, 0.86);
+    let bl = (0.16, 0.92);
     let head = in_tri(x, y, tl.0, tl.1, tr.0, tr.1, br.0, br.1)
         || in_tri(x, y, tl.0, tl.1, br.0, br.1, bl.0, bl.1);
-
-    if head && y > 0.70 {
-        // Carve thin vertical gaps to suggest bristles.
-        let stripe = (x * 34.0).floor() as i32;
-        if stripe.rem_euclid(6) == 0 {
-            return handle;
-        }
+    // Two wide notches hint at bristles without adding fragile detail. A notch
+    // cuts all the way out (the handle must not show through the gap).
+    if head {
+        let notched = y > 0.76 && (x * 12.0).floor() as i32 % 3 == 0;
+        return (!notched).then_some(Part::Head);
     }
-    head || handle
+
+    // Handle: lower-left → upper-right diagonal, thick enough to survive
+    // downsampling to 16 px.
+    if seg_dist(x, y, 0.30, 0.74, 0.66, 0.24) <= 0.072 {
+        return Some(Part::Handle);
+    }
+    None
+}
+
+/// A four-point sparkle centred on `(cx, cy)` with arm length `r`: two crossed
+/// tapered spikes, which stay readable at menu-bar size.
+fn in_sparkle(x: f32, y: f32, cx: f32, cy: f32, r: f32) -> bool {
+    let dx = (x - cx) / r;
+    let dy = (y - cy) / r;
+    // |dx|^p + |dy|^p <= 1 with p < 1 gives a concave four-point star.
+    let p = 0.62_f32;
+    dx.abs().powf(p) + dy.abs().powf(p) <= 1.0
 }
 
 fn seg_dist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
@@ -1063,5 +1266,142 @@ mod tests {
         };
         let missing = env::temp_dir().join("sweepmac-test-definitely-missing");
         assert!(clean_target(&t, &missing).is_ok());
+    }
+
+    // --- selection model -------------------------------------------------
+
+    fn sample() -> Vec<Selectable> {
+        vec![
+            Selectable::new("cache-a", 1_000, Risk::Regenerable),
+            Selectable::new("cache-b", 2_000, Risk::Regenerable),
+            Selectable::new("build-cache", 4_000, Risk::Conditional),
+            Selectable::new("img-in-use", 8_000, Risk::Conditional).locked(true),
+            Selectable::new("vol-data", 16_000, Risk::Irreversible),
+            Selectable::new("vol-mounted", 32_000, Risk::Irreversible).locked(true),
+        ]
+    }
+
+    #[test]
+    fn summarize_totals_only_selected_unlocked_items() {
+        let items = sample();
+        let selected = ["cache-a", "build-cache"];
+        let s = summarize(&items, |k| selected.contains(&k));
+        assert_eq!(
+            s,
+            SelectionSummary {
+                count: 2,
+                bytes: 5_000
+            }
+        );
+    }
+
+    #[test]
+    fn summarize_ignores_locked_items_even_if_selected() {
+        let items = sample();
+        // A stale key for a now-in-use image must not inflate the total.
+        let s = summarize(&items, |k| k == "img-in-use" || k == "cache-b");
+        assert_eq!(
+            s,
+            SelectionSummary {
+                count: 1,
+                bytes: 2_000
+            }
+        );
+    }
+
+    #[test]
+    fn summarize_empty_selection_is_empty() {
+        let s = summarize(&sample(), |_| false);
+        assert!(s.is_empty());
+        assert_eq!(s.bytes, 0);
+    }
+
+    #[test]
+    fn bulk_selection_never_includes_irreversible_or_locked() {
+        let keys = bulk_selectable_keys(&sample());
+        assert_eq!(keys, vec!["cache-a", "cache-b", "build-cache"]);
+        // The data-bearing volumes are the whole point of this rule.
+        assert!(!keys.iter().any(|k| k.starts_with("vol-")));
+        assert!(!keys.iter().any(|k| k == "img-in-use"));
+    }
+
+    #[test]
+    fn bulk_selection_of_only_irreversible_items_is_empty() {
+        let items = vec![
+            Selectable::new("vol-a", 1, Risk::Irreversible),
+            Selectable::new("vol-b", 2, Risk::Irreversible),
+        ];
+        assert!(bulk_selectable_keys(&items).is_empty());
+    }
+
+    #[test]
+    fn risk_bulk_selectability() {
+        assert!(Risk::Regenerable.bulk_selectable());
+        assert!(Risk::Conditional.bulk_selectable());
+        assert!(!Risk::Irreversible.bulk_selectable());
+    }
+
+    #[test]
+    fn action_is_enabled_only_with_a_selection_and_no_work_in_flight() {
+        let empty = SelectionSummary::default();
+        let some = SelectionSummary {
+            count: 1,
+            bytes: 10,
+        };
+        assert!(!action_enabled(empty, false), "nothing selected");
+        assert!(!action_enabled(empty, true));
+        assert!(!action_enabled(some, true), "busy cleaning");
+        assert!(action_enabled(some, false));
+    }
+
+    // --- tray/app glyph --------------------------------------------------
+
+    #[test]
+    fn broom_glyph_is_a_dense_readable_mark() {
+        // At menu-bar size the template must have real coverage (not hairlines)
+        // but still leave breathing room — a fully-filled square would read as
+        // a block, an almost-empty one as noise.
+        for size in [18u32, 36] {
+            let buf = broom_rgba(size, true);
+            assert_eq!(buf.len() as u32, size * size * 4);
+            let px = (size * size) as f32;
+            let opaque = buf.chunks(4).filter(|p| p[3] > 128).count() as f32;
+            let frac = opaque / px;
+            assert!(
+                (0.12..0.55).contains(&frac),
+                "template coverage at {size}px was {frac:.3}"
+            );
+            // Template images must be pure white + alpha so macOS can tint them.
+            for p in buf.chunks(4).filter(|p| p[3] > 0) {
+                assert_eq!((p[0], p[1], p[2]), (255, 255, 255));
+            }
+        }
+    }
+
+    /// The bundled template assets must decode at every scale the tray asks
+    /// for, be square, and carry a real alpha mask (macOS tints the alpha, so
+    /// an all-transparent or all-opaque asset would show nothing or a block).
+    #[cfg(feature = "icons")]
+    #[test]
+    fn tray_template_assets_decode_at_every_scale() {
+        for px in [18u32, 36, 54] {
+            let (rgba, w) = tray_template_rgba(px);
+            assert_eq!(w, px, "asset for {px}px reported the wrong width");
+            assert_eq!(rgba.len() as u32, px * px * 4);
+            let opaque = rgba.chunks(4).filter(|p| p[3] > 128).count() as f32;
+            let frac = opaque / (px * px) as f32;
+            assert!(
+                (0.05..0.60).contains(&frac),
+                "template coverage at {px}px was {frac:.3}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_icon_tile_is_opaque_in_the_centre() {
+        let size = 64u32;
+        let buf = broom_rgba(size, false);
+        let mid = ((size / 2 * size + size / 2) * 4) as usize;
+        assert_eq!(buf[mid + 3], 255, "tile centre must be opaque");
     }
 }

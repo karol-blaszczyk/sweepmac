@@ -1,10 +1,18 @@
-//! sweepmac GUI — a small, modern native window over the shared cleanup core.
+//! sweepmac GUI — a focused native window over the shared cleanup core.
 //!
-//! Each cache, plus Docker and old simulators, is cleared independently via its
-//! own button and confirmation dialog — no bulk checkboxes. Scanning and
-//! cleaning run on background threads; the worker talks back over a channel and
-//! wakes the UI with `request_repaint`.
+//! The screen is ordered by decision risk: what is safe to reclaim comes first
+//! and is preselected, conditional developer cleanup is one disclosure away,
+//! and anything that destroys data lives in a separate collapsed danger zone
+//! that is never bulk-selected.
+//!
+//! Selection is aggregated by the library (`sweepmac::summarize`), so the rules
+//! about what may be selected and when the primary action is live are tested
+//! without a window. Scanning and cleaning run on background threads; workers
+//! talk back over channels and wake the UI with `request_repaint`.
 
+mod ui;
+
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -13,19 +21,26 @@ use std::thread;
 use std::time::Instant;
 
 use eframe::egui;
-use egui::{Color32, Margin, RichText, Rounding};
+use egui::RichText;
 use sweepmac::{
-    clean_target, dir_size, disk_free, docker_info, find_node_modules, home, human,
-    persist_pty_limit, pty_status, raise_pty_limit, scan, target_by_id, DockerImage, DockerInfo,
-    DockerVolume, NodeModules, PtyLevel, PtyStatus, ALL_CATEGORIES,
+    action_enabled, bulk_selectable_keys, clean_target, dir_size, disk_free, docker_info,
+    find_node_modules, home, human, persist_pty_limit, pty_status, raise_pty_limit, scan,
+    summarize, target_by_id, DockerImage, DockerInfo, DockerVolume, NodeModules, PtyLevel,
+    PtyStatus, Risk, Selectable, SelectionSummary, ALL_CATEGORIES, DEFAULT_CLEAN_CATEGORIES,
 };
 
+use ui::style::{self, Tokens};
+use ui::widgets::{self as w, Activity, RowView};
+
 const PTY_TARGET: u64 = 999;
+/// How many recommended rows stay on the first screen before the rest are
+/// folded into their category group.
+const RECOMMENDED_VISIBLE: usize = 5;
 
 fn main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([560.0, 720.0])
-        .with_min_inner_size([460.0, 480.0])
+        .with_min_inner_size([460.0, 520.0])
         .with_title("sweepmac");
     viewport = viewport.with_icon(egui::IconData {
         rgba: sweepmac::broom_rgba(64, false),
@@ -40,57 +55,27 @@ fn main() -> eframe::Result<()> {
         "sweepmac",
         options,
         Box::new(|cc| {
-            install_style(&cc.egui_ctx);
-            Ok(Box::new(App::new(cc.egui_ctx.clone())))
+            style::install_system_font(&cc.egui_ctx);
+            let tokens = resolve_tokens(&cc.egui_ctx);
+            style::install(&cc.egui_ctx, &tokens);
+            // `--review` (used by the menu bar) opens straight on the review
+            // step for the recommended selection, once the first scan lands.
+            let review_on_open = std::env::args().any(|a| a == "--review");
+            Ok(Box::new(App::new(
+                cc.egui_ctx.clone(),
+                tokens,
+                review_on_open,
+            )))
         }),
     )
 }
 
-// --- palette -------------------------------------------------------------
-
-const BG: Color32 = Color32::from_rgb(0x14, 0x16, 0x1b);
-const CARD: Color32 = Color32::from_rgb(0x1e, 0x21, 0x2a);
-const CARD_HOVER: Color32 = Color32::from_rgb(0x26, 0x2a, 0x35);
-const TEXT: Color32 = Color32::from_rgb(0xe6, 0xe8, 0xee);
-const MUTED: Color32 = Color32::from_rgb(0x8a, 0x90, 0x9e);
-const ACCENT: Color32 = Color32::from_rgb(0x4c, 0x8d, 0xff);
-const DANGER: Color32 = Color32::from_rgb(0xe5, 0x4b, 0x4b);
-const NM: Color32 = Color32::from_rgb(0x3f, 0xc1, 0x80);
-const AMBER: Color32 = Color32::from_rgb(0xf2, 0xae, 0x3c);
-
-fn category_color(cat: &str) -> Color32 {
-    match cat {
-        "system" => Color32::from_rgb(0x5a, 0xd0, 0xd6),
-        "macos" => Color32::from_rgb(0x9a, 0xa0, 0xae),
-        "dev" => Color32::from_rgb(0x4c, 0x8d, 0xff),
-        "xcode" => Color32::from_rgb(0xff, 0x9f, 0x43),
-        "app" => Color32::from_rgb(0xa9, 0x6b, 0xff),
-        _ => MUTED,
+/// Follow the system appearance when macOS reports one; dark otherwise.
+fn resolve_tokens(ctx: &egui::Context) -> Tokens {
+    match ctx.system_theme() {
+        Some(theme) => Tokens::for_theme(theme),
+        None => Tokens::dark(),
     }
-}
-
-fn install_style(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
-    let v = &mut style.visuals;
-    v.dark_mode = true;
-    v.panel_fill = BG;
-    v.window_fill = CARD;
-    v.window_stroke = egui::Stroke::new(1.0, Color32::from_rgb(0x33, 0x37, 0x42));
-    v.override_text_color = Some(TEXT);
-    v.selection.bg_fill = ACCENT.gamma_multiply(0.4);
-    let r = Rounding::same(8.0);
-    for w in [
-        &mut v.widgets.inactive,
-        &mut v.widgets.hovered,
-        &mut v.widgets.active,
-        &mut v.widgets.open,
-        &mut v.widgets.noninteractive,
-    ] {
-        w.rounding = r;
-    }
-    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-    style.spacing.button_padding = egui::vec2(10.0, 5.0);
-    ctx.set_style(style);
 }
 
 // --- state ---------------------------------------------------------------
@@ -103,46 +88,70 @@ struct Row {
     size: u64,
 }
 
-/// One node_modules folder queued for bulk deletion.
+/// One unit of work in an approved batch.
 #[derive(Clone)]
-struct BulkItem {
-    label: String,
-    path: PathBuf,
-    size: u64,
-}
-
-/// What a confirmation dialog is about to do.
-#[derive(Clone)]
-enum Pending {
+enum Job {
     Cache {
         id: &'static str,
         desc: String,
         size: u64,
         path: PathBuf,
     },
-    Simulators {
-        size: u64,
-    },
-    /// Prune a single Docker category (kind: builder|image|container|network).
+    /// `docker <kind> prune` (kind: builder|image|container|network).
     DockerPrune {
         kind: &'static str,
         label: String,
+    },
+    NodeModules {
+        label: String,
+        path: PathBuf,
         size: u64,
     },
-    /// Delete specific Docker volumes (destroys their data).
-    DockerVolumes {
-        names: Vec<String>,
-        total: u64,
-    },
-    /// Remove specific Docker images by id.
-    DockerImages {
+    Simulators,
+}
+
+impl Job {
+    fn label(&self) -> String {
+        match self {
+            Job::Cache { desc, .. } => desc.clone(),
+            Job::DockerPrune { label, .. } => label.clone(),
+            Job::NodeModules { label, .. } => label.clone(),
+            Job::Simulators => "Unavailable iOS simulators".to_string(),
+        }
+    }
+
+    fn size(&self) -> u64 {
+        match self {
+            Job::Cache { size, .. } | Job::NodeModules { size, .. } => *size,
+            // Docker/simctl report their own reclaim; we don't pre-credit it.
+            Job::DockerPrune { .. } | Job::Simulators => 0,
+        }
+    }
+}
+
+/// The safe, reviewable batch built from the current selection.
+#[derive(Clone)]
+struct Review {
+    jobs: Vec<Job>,
+    /// Estimated reclaim, from the sizes we actually measured.
+    estimate: u64,
+    /// "Developer caches — 3 items · 2.1 GB" lines for the dialog.
+    groups: Vec<(String, usize, u64)>,
+}
+
+/// An irreversible action, confirmed on its own danger path.
+#[derive(Clone)]
+enum Danger {
+    /// Delete Docker volumes — destroys their contents.
+    DockerVolumes { names: Vec<String>, total: u64 },
+}
+
+/// A non-destructive Docker action kept next to its own list.
+#[derive(Clone)]
+enum DockerAction {
+    RemoveImages {
         ids: Vec<String>,
         names: Vec<String>,
-        total: u64,
-    },
-    /// Delete one or more selected node_modules folders.
-    NodeModulesBulk {
-        items: Vec<BulkItem>,
         total: u64,
     },
 }
@@ -150,30 +159,22 @@ enum Pending {
 enum Msg {
     Scanned {
         rows: Vec<Row>,
-        extras: Vec<(String, u64)>,
+        sims: u64,
         disk: (u64, u64),
         pty: Option<PtyStatus>,
     },
-    /// Docker breakdown finished (separate — `docker system df -v` is slow).
     DockerScanned(Option<DockerInfo>),
-    /// node_modules discovery finished (runs separately — it's slower).
     NmScanned(Vec<NodeModules>),
-    /// A live output line from a running operation.
     Log(String),
-    Cleaned {
+    /// A batch finished: what it freed and whether every job succeeded.
+    Done {
         freed: u64,
+        ok: bool,
+        summary: String,
+        rescan: bool,
     },
-    /// One node_modules dir was removed — drop it from the list as we go.
     NmRemoved {
         path: PathBuf,
-    },
-    /// A node_modules (bulk) delete finished — settle UI, no cache rescan.
-    NmDone {
-        freed: u64,
-    },
-    /// A pty-limit admin action finished.
-    PtyDone {
-        note: String,
     },
 }
 
@@ -181,52 +182,80 @@ enum Msg {
 enum Phase {
     Scanning,
     Idle,
-    Cleaning,
+    Working,
 }
 
 struct App {
     ctx: egui::Context,
+    tokens: Tokens,
+    mark: Option<egui::TextureHandle>,
     phase: Phase,
+
     rows: Vec<Row>,
-    extras: Vec<(String, u64)>,
+    sims: u64,
     disk: (u64, u64),
     pty: Option<PtyStatus>,
     docker: Option<DockerInfo>,
     docker_scanning: bool,
-    dvol_selected: std::collections::HashSet<String>,
-    dimg_selected: std::collections::HashSet<String>,
     node_modules: Vec<NodeModules>,
-    nm_selected: std::collections::HashSet<PathBuf>,
     nm_scanning: bool,
-    pending: Option<Pending>,
-    status: String,
+
+    /// The shared selection for safe/conditional items, keyed by `Selectable`.
+    selected: HashSet<String>,
+    /// Volumes are deliberately kept out of the shared selection.
+    vol_selected: HashSet<String>,
+    img_selected: HashSet<String>,
+
+    review: Option<Review>,
+    /// Set by `--review`: open the review step as soon as a scan has run.
+    review_on_open: bool,
+    danger: Option<Danger>,
+    /// Gate on the danger dialog — the user must acknowledge explicitly.
+    danger_ack: bool,
+    docker_action: Option<DockerAction>,
+
+    activity: Vec<Activity>,
+    activity_open: bool,
     log: Vec<String>,
+    status: String,
     started: Option<Instant>,
+    last_scan: Option<Instant>,
+
     rx: Option<Receiver<Msg>>,
     nm_rx: Option<Receiver<Msg>>,
     docker_rx: Option<Receiver<Msg>>,
 }
 
 impl App {
-    fn new(ctx: egui::Context) -> Self {
+    fn new(ctx: egui::Context, tokens: Tokens, review_on_open: bool) -> Self {
+        let mark = load_mark(&ctx);
         let mut app = App {
             ctx,
+            tokens,
+            mark,
+            review_on_open,
             phase: Phase::Idle,
             rows: Vec::new(),
-            extras: Vec::new(),
+            sims: 0,
             disk: (0, 0),
             pty: None,
             docker: None,
             docker_scanning: false,
-            dvol_selected: std::collections::HashSet::new(),
-            dimg_selected: std::collections::HashSet::new(),
             node_modules: Vec::new(),
-            nm_selected: std::collections::HashSet::new(),
             nm_scanning: false,
-            pending: None,
-            status: String::new(),
+            selected: HashSet::new(),
+            vol_selected: HashSet::new(),
+            img_selected: HashSet::new(),
+            review: None,
+            danger: None,
+            danger_ack: false,
+            docker_action: None,
+            activity: Vec::new(),
+            activity_open: false,
             log: Vec::new(),
+            status: String::new(),
             started: None,
+            last_scan: None,
             rx: None,
             nm_rx: None,
             docker_rx: None,
@@ -237,46 +266,7 @@ impl App {
         app
     }
 
-    /// Query Docker on its own thread — `docker system df -v` can take ~15s, so
-    /// it must not block the cache view or button interactivity.
-    fn start_docker_scan(&mut self) {
-        self.docker_scanning = true;
-        let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
-        self.docker_rx = Some(rx);
-        let ctx = self.ctx.clone();
-        thread::spawn(move || {
-            let info = docker_info();
-            let _ = tx.send(Msg::DockerScanned(info));
-            ctx.request_repaint();
-        });
-    }
-
-    /// Discover node_modules dirs on a background thread (slower than caches,
-    /// so it runs on its own channel and doesn't block the cache view).
-    fn start_nm_scan(&mut self) {
-        self.nm_scanning = true;
-        self.nm_selected.clear();
-        let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
-        self.nm_rx = Some(rx);
-        let ctx = self.ctx.clone();
-        thread::spawn(move || {
-            let found = home().map(|h| find_node_modules(&h)).unwrap_or_default();
-            let _ = tx.send(Msg::NmScanned(found));
-            ctx.request_repaint();
-        });
-    }
-
-    fn nm_total(&self) -> u64 {
-        self.node_modules.iter().map(|n| n.size).sum()
-    }
-
-    fn nm_selected_total(&self) -> u64 {
-        self.node_modules
-            .iter()
-            .filter(|n| self.nm_selected.contains(&n.path))
-            .map(|n| n.size)
-            .sum()
-    }
+    // --- scanning (never deletes) ---------------------------------------
 
     fn start_scan(&mut self) {
         self.phase = Phase::Scanning;
@@ -296,34 +286,385 @@ impl App {
                     size: r.size,
                 })
                 .collect();
-            // Only the iOS simulator size here (fast-ish). Docker is scanned
-            // separately because `docker system df -v` is slow.
-            let extras = home()
+            // Simulator size only; Docker is scanned separately (it is slow).
+            let sims = home()
                 .ok()
                 .map(|h| h.join("Library/Developer/CoreSimulator"))
                 .filter(|p| p.exists())
                 .map(|p| dir_size(&p))
-                .filter(|s| *s > 0)
-                .map(|s| vec![("iOS Simulators (CoreSimulator)".to_string(), s)])
-                .unwrap_or_default();
-            let disk = disk_free().unwrap_or((0, 0));
-            let pty = pty_status();
+                .unwrap_or(0);
             let _ = tx.send(Msg::Scanned {
                 rows,
-                extras,
-                disk,
-                pty,
+                sims,
+                disk: disk_free().unwrap_or((0, 0)),
+                pty: pty_status(),
             });
             ctx.request_repaint();
         });
     }
 
-    /// Run a pty-limit admin action (raise or persist) on a background thread.
-    fn run_pty(&mut self, persist: bool) {
-        self.phase = Phase::Cleaning;
+    fn start_docker_scan(&mut self) {
+        self.docker_scanning = true;
+        let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
+        self.docker_rx = Some(rx);
+        let ctx = self.ctx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(Msg::DockerScanned(docker_info()));
+            ctx.request_repaint();
+        });
+    }
+
+    fn start_nm_scan(&mut self) {
+        self.nm_scanning = true;
+        let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
+        self.nm_rx = Some(rx);
+        let ctx = self.ctx.clone();
+        thread::spawn(move || {
+            let found = home().map(|h| find_node_modules(&h)).unwrap_or_default();
+            let _ = tx.send(Msg::NmScanned(found));
+            ctx.request_repaint();
+        });
+    }
+
+    // --- selection ------------------------------------------------------
+
+    /// Every item that participates in the shared selection, in one list, so
+    /// the library can do the aggregation and bulk-selection filtering.
+    fn selectables(&self) -> Vec<Selectable> {
+        let mut items = Vec::new();
+        for r in self.rows.iter().filter(|r| r.size > 0) {
+            items.push(Selectable::new(cache_key(r.id), r.size, Risk::Regenerable));
+        }
+        if let Some(d) = &self.docker {
+            for (kind, _, size) in docker_prune_kinds(d) {
+                items.push(Selectable::new(docker_key(kind), size, Risk::Conditional));
+            }
+        }
+        for nm in &self.node_modules {
+            items.push(Selectable::new(
+                nm_key(&nm.path),
+                nm.size,
+                Risk::Conditional,
+            ));
+        }
+        if self.sims > 0 {
+            items.push(Selectable::new("sims", self.sims, Risk::Conditional));
+        }
+        // Volumes are listed so bulk-selection filtering can *exclude* them.
+        if let Some(d) = &self.docker {
+            for v in &d.volumes {
+                items.push(
+                    Selectable::new(vol_key(&v.name), v.size, Risk::Irreversible).locked(v.in_use),
+                );
+            }
+        }
+        items
+    }
+
+    fn summary(&self) -> SelectionSummary {
+        summarize(&self.selectables(), |k| self.selected.contains(k))
+    }
+
+    /// Total of the safe, regenerable caches — the headline number.
+    fn safe_reclaimable(&self) -> u64 {
+        self.rows
+            .iter()
+            .filter(|r| DEFAULT_CLEAN_CATEGORIES.contains(&r.category))
+            .map(|r| r.size)
+            .sum()
+    }
+
+    /// Preselect the regenerable caches a scan found. Never touches anything
+    /// conditional or irreversible.
+    fn apply_recommended_selection(&mut self) {
+        self.selected.clear();
+        for r in self
+            .rows
+            .iter()
+            .filter(|r| r.size > 0 && DEFAULT_CLEAN_CATEGORIES.contains(&r.category))
+        {
+            self.selected.insert(cache_key(r.id));
+        }
+    }
+
+    /// The recommended rows, largest first.
+    fn recommended(&self) -> Vec<&Row> {
+        let mut v: Vec<&Row> = self
+            .rows
+            .iter()
+            .filter(|r| r.size > 0 && self.selected.contains(&cache_key(r.id)))
+            .collect();
+        v.sort_by(|a, b| b.size.cmp(&a.size));
+        v
+    }
+
+    fn toggle(&mut self, key: String) {
+        if !self.selected.remove(&key) {
+            self.selected.insert(key);
+        }
+    }
+
+    // --- building and running work --------------------------------------
+
+    /// Turn the current selection into a reviewable batch.
+    fn build_review(&self) -> Option<Review> {
+        let mut jobs: Vec<Job> = Vec::new();
+        let mut groups: Vec<(String, usize, u64)> = Vec::new();
+
+        // Caches, grouped for the dialog by their display group.
+        for (label, cats) in GROUPS {
+            let picked: Vec<&Row> = self
+                .rows
+                .iter()
+                .filter(|r| {
+                    r.size > 0
+                        && cats.contains(&r.category)
+                        && self.selected.contains(&cache_key(r.id))
+                })
+                .collect();
+            if picked.is_empty() {
+                continue;
+            }
+            let bytes: u64 = picked.iter().map(|r| r.size).sum();
+            groups.push((label.to_string(), picked.len(), bytes));
+            for r in picked {
+                jobs.push(Job::Cache {
+                    id: r.id,
+                    desc: r.desc.to_string(),
+                    size: r.size,
+                    path: r.path.clone(),
+                });
+            }
+        }
+
+        // Docker prune categories.
+        if let Some(d) = &self.docker {
+            let picked: Vec<(&'static str, &'static str, u64)> = docker_prune_kinds(d)
+                .into_iter()
+                .filter(|(kind, _, _)| self.selected.contains(&docker_key(kind)))
+                .collect();
+            if !picked.is_empty() {
+                let bytes: u64 = picked.iter().map(|(_, _, s)| *s).sum();
+                groups.push(("Docker".to_string(), picked.len(), bytes));
+                for (kind, label, _) in picked {
+                    jobs.push(Job::DockerPrune {
+                        kind,
+                        label: label.to_string(),
+                    });
+                }
+            }
+        }
+
+        // node_modules.
+        let nm: Vec<&NodeModules> = self
+            .node_modules
+            .iter()
+            .filter(|n| self.selected.contains(&nm_key(&n.path)))
+            .collect();
+        if !nm.is_empty() {
+            let bytes: u64 = nm.iter().map(|n| n.size).sum();
+            groups.push(("node_modules".to_string(), nm.len(), bytes));
+            for n in nm {
+                jobs.push(Job::NodeModules {
+                    label: n.label.clone(),
+                    path: n.path.clone(),
+                    size: n.size,
+                });
+            }
+        }
+
+        if self.selected.contains("sims") && self.sims > 0 {
+            groups.push(("iOS simulators".to_string(), 1, self.sims));
+            jobs.push(Job::Simulators);
+        }
+
+        if jobs.is_empty() {
+            return None;
+        }
+        let estimate = jobs.iter().map(|j| j.size()).sum();
+        Some(Review {
+            jobs,
+            estimate,
+            groups,
+        })
+    }
+
+    /// Run an approved batch of safe/conditional jobs on a worker thread.
+    fn run_jobs(&mut self, jobs: Vec<Job>, estimate: u64) {
+        self.phase = Phase::Working;
         self.log.clear();
         self.started = Some(Instant::now());
-        self.status = "Awaiting admin password…".into();
+        self.status = format!("Cleaning {} item{}…", jobs.len(), w::plural(jobs.len()));
+        let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
+        self.rx = Some(rx);
+        let ctx = self.ctx.clone();
+        thread::spawn(move || {
+            let mut freed = 0u64;
+            let mut failures = 0usize;
+            let count = jobs.len();
+            for job in jobs {
+                match job {
+                    Job::Cache {
+                        id,
+                        desc,
+                        size,
+                        path,
+                    } => {
+                        let _ = tx.send(Msg::Log(format!("clean {}", path.display())));
+                        ctx.request_repaint();
+                        match target_by_id(id) {
+                            Some(t) if clean_target(t, &path).is_ok() => {
+                                freed += size;
+                                let _ = tx
+                                    .send(Msg::Log(format!("  cleaned {desc} ({})", human(size))));
+                            }
+                            _ => {
+                                failures += 1;
+                                let _ = tx.send(Msg::Log(format!("  FAILED to clean {desc}")));
+                            }
+                        }
+                    }
+                    Job::DockerPrune { kind, label } => {
+                        let args: &[&str] = match kind {
+                            "builder" => &["builder", "prune", "-af"],
+                            "image" => &["image", "prune", "-af"],
+                            "container" => &["container", "prune", "-f"],
+                            "network" => &["network", "prune", "-f"],
+                            _ => &[],
+                        };
+                        let _ = tx.send(Msg::Log(format!("$ docker {} — {label}", args.join(" "))));
+                        ctx.request_repaint();
+                        stream(&tx, &ctx, sweepmac::docker_bin(), args);
+                    }
+                    Job::NodeModules { label, path, size } => {
+                        let _ = tx.send(Msg::Log(format!("rm -rf {}", path.display())));
+                        ctx.request_repaint();
+                        match std::fs::remove_dir_all(&path) {
+                            Ok(()) => {
+                                freed += size;
+                                let _ = tx
+                                    .send(Msg::Log(format!("  removed {label} ({})", human(size))));
+                                let _ = tx.send(Msg::NmRemoved { path });
+                            }
+                            Err(e) => {
+                                failures += 1;
+                                let _ = tx.send(Msg::Log(format!("  FAILED {label}: {e}")));
+                            }
+                        }
+                    }
+                    Job::Simulators => {
+                        let _ = tx.send(Msg::Log("$ xcrun simctl delete unavailable".into()));
+                        ctx.request_repaint();
+                        stream(&tx, &ctx, "xcrun", &["simctl", "delete", "unavailable"]);
+                    }
+                }
+                ctx.request_repaint();
+            }
+            let ok = failures == 0;
+            let summary = if ok {
+                if freed > 0 {
+                    format!(
+                        "Cleaned {count} item{} · {}",
+                        w::plural(count),
+                        human(freed)
+                    )
+                } else {
+                    format!("Cleaned {count} item{}", w::plural(count))
+                }
+            } else {
+                format!(
+                    "{failures} of {count} item{} failed · {} reclaimed",
+                    w::plural(count),
+                    human(freed)
+                )
+            };
+            let _ = tx.send(Msg::Done {
+                freed,
+                ok,
+                summary,
+                rescan: true,
+            });
+            let _ = estimate;
+            ctx.request_repaint();
+        });
+    }
+
+    /// Run an irreversible action after its own explicit confirmation.
+    fn run_danger(&mut self, d: Danger) {
+        self.phase = Phase::Working;
+        self.log.clear();
+        self.started = Some(Instant::now());
+        let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
+        self.rx = Some(rx);
+        let ctx = self.ctx.clone();
+        match d {
+            Danger::DockerVolumes { names, total } => {
+                self.status = format!(
+                    "Deleting {} volume{} permanently…",
+                    names.len(),
+                    w::plural(names.len())
+                );
+                thread::spawn(move || {
+                    let count = names.len();
+                    for name in &names {
+                        let _ = tx.send(Msg::Log(format!("$ docker volume rm {name}")));
+                        ctx.request_repaint();
+                        stream(&tx, &ctx, sweepmac::docker_bin(), &["volume", "rm", name]);
+                    }
+                    let _ = tx.send(Msg::Done {
+                        freed: 0,
+                        ok: true,
+                        summary: format!(
+                            "Deleted {count} volume{} permanently ({})",
+                            w::plural(count),
+                            human(total)
+                        ),
+                        rescan: true,
+                    });
+                    ctx.request_repaint();
+                });
+            }
+        }
+    }
+
+    fn run_docker_action(&mut self, a: DockerAction) {
+        self.phase = Phase::Working;
+        self.log.clear();
+        self.started = Some(Instant::now());
+        let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
+        self.rx = Some(rx);
+        let ctx = self.ctx.clone();
+        match a {
+            DockerAction::RemoveImages { ids, names, total } => {
+                self.status = format!("Removing {} image{}…", ids.len(), w::plural(ids.len()));
+                thread::spawn(move || {
+                    let count = ids.len();
+                    let _ = tx.send(Msg::Log(format!("$ docker rmi {}", names.join(" "))));
+                    ctx.request_repaint();
+                    let mut args = vec!["rmi"];
+                    args.extend(ids.iter().map(|s| s.as_str()));
+                    stream(&tx, &ctx, sweepmac::docker_bin(), &args);
+                    let _ = tx.send(Msg::Done {
+                        freed: 0,
+                        ok: true,
+                        summary: format!(
+                            "Removed {count} image{} ({})",
+                            w::plural(count),
+                            human(total)
+                        ),
+                        rescan: true,
+                    });
+                    ctx.request_repaint();
+                });
+            }
+        }
+    }
+
+    fn run_pty(&mut self, persist: bool) {
+        self.phase = Phase::Working;
+        self.log.clear();
+        self.started = Some(Instant::now());
+        self.status = "Waiting for your admin password…".into();
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
         self.rx = Some(rx);
         let ctx = self.ctx.clone();
@@ -333,161 +674,68 @@ impl App {
             } else {
                 raise_pty_limit(PTY_TARGET)
             };
-            let note = match action {
+            let (ok, summary) = match action {
                 Ok(_) => {
+                    let extra = if persist {
+                        " (persisted to /etc/sysctl.conf)"
+                    } else {
+                        ""
+                    };
                     let _ = tx.send(Msg::Log(format!(
-                        "✓ kern.tty.ptmx_max set to {PTY_TARGET}{}",
-                        if persist {
-                            " (persisted to /etc/sysctl.conf)"
-                        } else {
-                            ""
-                        }
+                        "kern.tty.ptmx_max set to {PTY_TARGET}{extra}"
                     )));
-                    format!("pty limit raised to {PTY_TARGET}")
+                    (true, format!("Terminal limit raised to {PTY_TARGET}"))
                 }
                 Err(e) if e == "cancelled" => {
-                    let _ = tx.send(Msg::Log("✗ cancelled at password prompt".into()));
-                    "cancelled".into()
+                    let _ = tx.send(Msg::Log("cancelled at the password prompt".into()));
+                    (false, "Cancelled at the password prompt".to_string())
                 }
                 Err(e) => {
-                    let _ = tx.send(Msg::Log(format!("✗ {e}")));
-                    "failed".into()
+                    let _ = tx.send(Msg::Log(e.clone()));
+                    (false, format!("Could not raise the terminal limit: {e}"))
                 }
             };
-            let _ = tx.send(Msg::PtyDone { note });
+            let _ = tx.send(Msg::Done {
+                freed: 0,
+                ok,
+                summary,
+                rescan: false,
+            });
             ctx.request_repaint();
         });
-    }
-
-    /// Execute whatever the confirmation approved.
-    fn run_pending(&mut self, p: Pending) {
-        self.phase = Phase::Cleaning;
-        self.log.clear();
-        self.started = Some(Instant::now());
-        let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
-        self.rx = Some(rx);
-        let ctx = self.ctx.clone();
-        match p {
-            Pending::Cache {
-                id,
-                desc,
-                size,
-                path,
-            } => {
-                self.status = format!("Clearing {desc}…");
-                thread::spawn(move || {
-                    let _ = tx.send(Msg::Log(format!("Removing {}", path.display())));
-                    ctx.request_repaint();
-                    let freed = match target_by_id(id) {
-                        Some(t) if clean_target(t, &path).is_ok() => {
-                            let _ =
-                                tx.send(Msg::Log(format!("✓ cleared {desc} ({})", human(size))));
-                            size
-                        }
-                        _ => {
-                            let _ = tx.send(Msg::Log(format!("✗ failed to clear {desc}")));
-                            0
-                        }
-                    };
-                    let _ = tx.send(Msg::Cleaned { freed });
-                    ctx.request_repaint();
-                });
-            }
-            Pending::DockerPrune { kind, label, .. } => {
-                self.status = format!("Pruning {label}…");
-                thread::spawn(move || {
-                    let args: &[&str] = match kind {
-                        "builder" => &["builder", "prune", "-af"],
-                        "image" => &["image", "prune", "-af"],
-                        "container" => &["container", "prune", "-f"],
-                        "network" => &["network", "prune", "-f"],
-                        _ => &[],
-                    };
-                    let _ = tx.send(Msg::Log(format!("$ docker {}", args.join(" "))));
-                    ctx.request_repaint();
-                    stream(&tx, &ctx, sweepmac::docker_bin(), args);
-                    let _ = tx.send(Msg::Cleaned { freed: 0 });
-                    ctx.request_repaint();
-                });
-            }
-            Pending::DockerVolumes { names, total } => {
-                self.status = format!("Deleting {} volume(s) ({})…", names.len(), human(total));
-                thread::spawn(move || {
-                    for name in &names {
-                        let _ = tx.send(Msg::Log(format!("$ docker volume rm {name}")));
-                        ctx.request_repaint();
-                        stream(&tx, &ctx, sweepmac::docker_bin(), &["volume", "rm", name]);
-                    }
-                    let _ = tx.send(Msg::Cleaned { freed: 0 });
-                    ctx.request_repaint();
-                });
-            }
-            Pending::DockerImages { ids, names, total } => {
-                self.status = format!("Removing {} image(s) ({})…", ids.len(), human(total));
-                thread::spawn(move || {
-                    let _ = tx.send(Msg::Log(format!("$ docker rmi {}", names.join(" "))));
-                    ctx.request_repaint();
-                    let refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
-                    let mut args = vec!["rmi"];
-                    args.extend(refs);
-                    stream(&tx, &ctx, sweepmac::docker_bin(), &args);
-                    let _ = tx.send(Msg::Cleaned { freed: 0 });
-                    ctx.request_repaint();
-                });
-            }
-            Pending::Simulators { .. } => {
-                self.status = "Deleting unavailable simulators…".into();
-                thread::spawn(move || {
-                    let _ = tx.send(Msg::Log("$ xcrun simctl delete unavailable".into()));
-                    ctx.request_repaint();
-                    stream(&tx, &ctx, "xcrun", &["simctl", "delete", "unavailable"]);
-                    let _ = tx.send(Msg::Log(
-                        "done — this can take a minute on a big device set".into(),
-                    ));
-                    let _ = tx.send(Msg::Cleaned { freed: 0 });
-                    ctx.request_repaint();
-                });
-            }
-            Pending::NodeModulesBulk { items, total } => {
-                self.status = format!("Removing {} folders ({})…", items.len(), human(total));
-                thread::spawn(move || {
-                    let mut freed = 0u64;
-                    for item in items {
-                        let _ = tx.send(Msg::Log(format!("rm -rf {}", item.path.display())));
-                        ctx.request_repaint();
-                        match std::fs::remove_dir_all(&item.path) {
-                            Ok(()) => {
-                                freed += item.size;
-                                let _ = tx.send(Msg::Log(format!(
-                                    "✓ {} ({})",
-                                    item.label,
-                                    human(item.size)
-                                )));
-                                let _ = tx.send(Msg::NmRemoved { path: item.path });
-                            }
-                            Err(e) => {
-                                let _ = tx.send(Msg::Log(format!("✗ {}: {e}", item.label)));
-                            }
-                        }
-                        ctx.request_repaint();
-                    }
-                    let _ = tx.send(Msg::NmDone { freed });
-                    ctx.request_repaint();
-                });
-            }
-        }
-    }
-
-    fn cache_total(&self) -> u64 {
-        self.rows.iter().map(|r| r.size).sum()
     }
 
     fn elapsed_secs(&self) -> u64 {
         self.started.map(|t| t.elapsed().as_secs()).unwrap_or(0)
     }
 
+    /// Human age of the last completed scan, e.g. "just now", "4 min ago".
+    fn last_scan_age(&self) -> Option<String> {
+        let secs = self.last_scan?.elapsed().as_secs();
+        Some(match secs {
+            0..=20 => "just now".to_string(),
+            21..=90 => "a minute ago".to_string(),
+            _ if secs < 3600 => format!("{} min ago", secs / 60),
+            _ => format!("{}h ago", secs / 3600),
+        })
+    }
+
+    fn push_activity(&mut self, ok: bool, summary: String) {
+        let detail = std::mem::take(&mut self.log);
+        self.activity.push(Activity {
+            ok,
+            summary,
+            detail,
+        });
+        let overflow = self.activity.len().saturating_sub(20);
+        if overflow > 0 {
+            self.activity.drain(0..overflow);
+        }
+        // Surface the result: the section opens itself once there is news.
+        self.activity_open = true;
+    }
+
     fn poll(&mut self) {
-        // Drain everything available this frame (streaming sends many lines).
         let mut batch: Vec<Msg> = Vec::new();
         if let Some(rx) = &self.rx {
             while let Ok(msg) = rx.try_recv() {
@@ -498,62 +746,65 @@ impl App {
             match msg {
                 Msg::Log(line) => {
                     self.log.push(line);
-                    let overflow = self.log.len().saturating_sub(200);
+                    let overflow = self.log.len().saturating_sub(400);
                     if overflow > 0 {
                         self.log.drain(0..overflow);
                     }
                 }
                 Msg::Scanned {
                     rows,
-                    extras,
+                    sims,
                     disk,
                     pty,
                 } => {
                     self.rows = rows;
-                    self.extras = extras;
+                    self.sims = sims;
                     self.disk = disk;
                     self.pty = pty;
                     self.phase = Phase::Idle;
                     self.started = None;
-                    self.status = format!("{} reclaimable", human(self.cache_total()));
+                    self.last_scan = Some(Instant::now());
+                    self.apply_recommended_selection();
+                    self.status = format!("{} safely reclaimable", human(self.safe_reclaimable()));
                     self.rx = None;
+                    if std::mem::take(&mut self.review_on_open) {
+                        self.review = self.build_review();
+                    }
                 }
-                Msg::DockerScanned(_) => {} // arrives on docker_rx, handled below
-                Msg::PtyDone { note } => {
+                Msg::Done {
+                    freed,
+                    ok,
+                    summary,
+                    rescan,
+                } => {
                     self.phase = Phase::Idle;
                     self.started = None;
-                    self.pty = pty_status(); // cheap re-check on the main thread
-                    self.status = note;
-                    self.rx = None;
-                }
-                Msg::Cleaned { freed } => {
-                    self.phase = Phase::Idle;
-                    self.started = None;
-                    self.dvol_selected.clear();
-                    self.dimg_selected.clear();
+                    self.vol_selected.clear();
+                    self.img_selected.clear();
+                    self.danger_ack = false;
+                    self.push_activity(ok, summary);
                     self.status = if freed > 0 {
                         format!("Reclaimed {}", human(freed))
                     } else {
                         "Done".into()
                     };
-                    self.start_scan(); // replaces self.rx with the scan channel
-                    self.start_docker_scan(); // refresh Docker too (e.g. after prune)
+                    self.rx = None;
+                    if rescan {
+                        // Refresh totals and the selection from reality.
+                        self.start_scan();
+                        self.start_docker_scan();
+                    } else {
+                        self.pty = pty_status();
+                    }
                 }
                 Msg::NmRemoved { path } => {
                     self.node_modules.retain(|n| n.path != path);
-                    self.nm_selected.remove(&path);
+                    self.selected.remove(&nm_key(&path));
                 }
-                Msg::NmDone { freed } => {
-                    self.phase = Phase::Idle;
-                    self.started = None;
-                    self.status = format!("Reclaimed {}", human(freed));
-                    self.rx = None;
-                }
-                Msg::NmScanned(_) => {} // arrives on nm_rx, handled below
+                Msg::DockerScanned(_) | Msg::NmScanned(_) => {}
             }
         }
 
-        // node_modules discovery runs on its own channel.
         let mut nm_batch: Vec<Msg> = Vec::new();
         if let Some(rx) = &self.nm_rx {
             while let Ok(msg) = rx.try_recv() {
@@ -568,7 +819,6 @@ impl App {
             }
         }
 
-        // Docker scan runs on its own (slow) channel.
         let mut docker_batch: Vec<Msg> = Vec::new();
         if let Some(rx) = &self.docker_rx {
             while let Ok(msg) = rx.try_recv() {
@@ -585,6 +835,65 @@ impl App {
     }
 }
 
+/// Everything a render pass wants to change about app state, collected while
+/// the UI holds `&self` and applied once the borrow ends.
+#[derive(Default)]
+struct Effects {
+    /// Shared-selection keys to toggle.
+    toggles: Vec<String>,
+    vol_toggles: Vec<String>,
+    img_toggles: Vec<String>,
+    img_set_all: Option<bool>,
+    request_images: bool,
+    request_volumes: bool,
+    /// `Some(persist)` when a pty action was clicked.
+    pty_action: Option<bool>,
+    rescan_nm: bool,
+}
+
+/// Display groups for cache categories, in first-screen order.
+const GROUPS: &[(&str, &[&str])] = &[
+    ("Developer caches", &["dev", "xcode"]),
+    ("System caches", &["system", "macos"]),
+    ("App caches", &["app"]),
+];
+
+fn cache_key(id: &str) -> String {
+    format!("cache:{id}")
+}
+fn docker_key(kind: &str) -> String {
+    format!("docker:{kind}")
+}
+fn nm_key(p: &std::path::Path) -> String {
+    format!("nm:{}", p.display())
+}
+fn vol_key(name: &str) -> String {
+    format!("vol:{name}")
+}
+
+/// The Docker prune categories shown in Advanced, with their reclaimable size.
+fn docker_prune_kinds(d: &DockerInfo) -> Vec<(&'static str, &'static str, u64)> {
+    vec![
+        ("builder", "Build cache", d.build_cache),
+        ("image", "Unused images", d.images),
+        ("container", "Stopped containers", d.containers),
+        ("network", "Unused networks", 0),
+    ]
+}
+
+/// The window's sweepmac mark: the same alpha-mask glyph the menu bar uses, so
+/// the two front-ends read as one product. It is tinted by the text colour at
+/// draw time, which is why the mask is loaded rather than a coloured icon.
+fn load_mark(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let (rgba, px) = sweepmac::tray_template_rgba(54);
+    let size = px as usize;
+    // Tinting multiplies, so a black mask would stay black: keep the alpha and
+    // make the covered pixels white.
+    let white: Vec<u8> = rgba.chunks(4).flat_map(|p| [255, 255, 255, p[3]]).collect();
+    let image = egui::ColorImage::from_rgba_unmultiplied([size, size], &white);
+    Some(ctx.load_texture("sweepmac-mark", image, egui::TextureOptions::LINEAR))
+}
+
 // --- rendering -----------------------------------------------------------
 
 impl eframe::App for App {
@@ -593,811 +902,853 @@ impl eframe::App for App {
         if self.phase != Phase::Idle {
             ctx.request_repaint();
         }
+        // Follow a system appearance change without a restart.
+        let wanted = resolve_tokens(ctx);
+        if wanted != self.tokens {
+            self.tokens = wanted;
+            style::install(ctx, &self.tokens);
+        }
 
         self.top_panel(ctx);
         self.bottom_panel(ctx);
         self.central(ctx);
-        self.confirm_dialog(ctx);
+        self.review_dialog(ctx);
+        self.danger_dialog(ctx);
+        self.docker_action_dialog(ctx);
     }
 }
 
 impl App {
     fn top_panel(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("top")
+        let t = self.tokens;
+        egui::TopBottomPanel::top("header")
             .frame(
                 egui::Frame::default()
-                    .fill(BG)
-                    .inner_margin(Margin::symmetric(16.0, 14.0)),
+                    .fill(t.canvas)
+                    .inner_margin(egui::Margin::symmetric(style::GUTTER, style::PANEL_PAD_Y)),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("🧹").size(24.0));
-                    ui.add_space(4.0);
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new("sweepmac").size(20.0).strong().color(TEXT));
-                        ui.label(
-                            RichText::new("Regenerable caches — safe to clear")
-                                .size(11.0)
-                                .color(MUTED),
-                        );
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let busy = self.phase != Phase::Idle;
-                        if ui.add_enabled(!busy, ghost_button("↻  Rescan")).clicked() {
-                            self.start_scan();
-                        }
-                    });
-                });
-
-                // Disk usage bar.
-                let (free, total) = self.disk;
-                if total > 0 {
-                    ui.add_space(12.0);
-                    let used = total.saturating_sub(free);
-                    let frac = used as f32 / total as f32;
-                    let bar = egui::ProgressBar::new(frac)
-                        .desired_height(10.0)
-                        .rounding(Rounding::same(5.0))
-                        .fill(if frac > 0.9 { DANGER } else { ACCENT });
-                    ui.add(bar);
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!("{} free", human(free)))
-                                .size(11.0)
-                                .color(MUTED),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            // Compact pty indicator on the right of the disk line.
-                            if let Some(pty) = self.pty {
-                                let c = match pty.level {
-                                    PtyLevel::Ok => MUTED,
-                                    PtyLevel::Warn => AMBER,
-                                    PtyLevel::Critical => DANGER,
-                                };
-                                ui.label(
-                                    RichText::new(format!("· pty {}/{}", pty.nodes, pty.cap))
-                                        .size(11.0)
-                                        .color(c),
-                                );
-                            }
-                            ui.label(
-                                RichText::new(format!("of {}", human(total)))
-                                    .size(11.0)
-                                    .color(MUTED),
-                            );
-                        });
-                    });
+                let age = self.last_scan_age();
+                let res = w::header(
+                    ui,
+                    &t,
+                    self.mark.as_ref(),
+                    age.as_deref(),
+                    self.phase != Phase::Idle,
+                );
+                if res.rescan_clicked {
+                    self.start_scan();
+                    self.start_docker_scan();
+                    self.start_nm_scan();
                 }
+                ui.add_space(14.0);
+                w::storage_summary(
+                    ui,
+                    &t,
+                    self.safe_reclaimable(),
+                    self.summary().bytes,
+                    self.disk,
+                    self.phase == Phase::Scanning,
+                );
             });
     }
 
     fn bottom_panel(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("bottom")
+        let t = self.tokens;
+        egui::TopBottomPanel::bottom("actions")
             .frame(
                 egui::Frame::default()
-                    .fill(BG)
-                    .inner_margin(Margin::symmetric(16.0, 10.0)),
+                    .fill(t.canvas)
+                    .inner_margin(egui::Margin::symmetric(style::GUTTER, 12.0))
+                    .stroke(egui::Stroke::new(1.0, t.divider)),
             )
             .show(ctx, |ui| {
-                // Live activity log — visible while running or right after.
-                let running = self.phase == Phase::Cleaning;
-                if running || !self.log.is_empty() {
-                    egui::Frame::default()
-                        .fill(Color32::from_rgb(0x10, 0x12, 0x16))
-                        .rounding(Rounding::same(8.0))
-                        .inner_margin(Margin::symmetric(10.0, 8.0))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("Activity").size(11.0).strong().color(MUTED),
-                                );
-                                if running {
-                                    ui.label(
-                                        RichText::new(format!("• {}s", self.elapsed_secs()))
-                                            .size(11.0)
-                                            .color(ACCENT),
-                                    );
-                                }
-                            });
-                            egui::ScrollArea::vertical()
-                                .max_height(96.0)
-                                .stick_to_bottom(true)
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    if self.log.is_empty() {
-                                        ui.label(
-                                            RichText::new("starting…")
-                                                .size(11.5)
-                                                .monospace()
-                                                .color(MUTED),
-                                        );
-                                    }
-                                    for line in &self.log {
-                                        ui.label(
-                                            RichText::new(line).size(11.5).monospace().color(MUTED),
-                                        );
-                                    }
-                                });
-                        });
-                    ui.add_space(8.0);
+                let summary = self.summary();
+                let busy = self.phase == Phase::Working;
+                let busy_label = busy.then(|| self.status.clone());
+                let enabled = action_enabled(summary, busy);
+                if w::action_bar(ui, &t, summary, enabled, busy_label.as_deref()) {
+                    self.review = self.build_review();
                 }
-
-                ui.horizontal(|ui| {
-                    if running {
-                        ui.add(egui::Spinner::new().size(14.0));
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new(format!("{} ({}s)", self.status, self.elapsed_secs()))
-                                .size(12.0)
-                                .color(MUTED),
-                        );
-                    } else {
-                        ui.label(RichText::new(&self.status).size(12.0).color(MUTED));
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(format!("{} in caches", human(self.cache_total())))
-                                .size(12.0)
-                                .strong()
-                                .color(TEXT),
-                        );
-                    });
-                });
             });
     }
 
     fn central(&mut self, ctx: &egui::Context) {
+        let t = self.tokens;
         egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(BG).inner_margin(Margin::symmetric(14.0, 8.0)))
+            .frame(
+                egui::Frame::default()
+                    .fill(t.canvas)
+                    .inner_margin(egui::Margin::symmetric(style::GUTTER, 4.0)),
+            )
             .show(ctx, |ui| {
                 if self.phase == Phase::Scanning && self.rows.is_empty() {
-                    ui.centered_and_justified(|ui| ui.add(egui::Spinner::new().size(28.0)));
+                    ui.centered_and_justified(|ui| {
+                        ui.add(egui::Spinner::new().size(26.0).color(t.text_muted));
+                    });
                     return;
                 }
 
-                // Only a running *cleanup* blocks actions — a background (re)scan
-                // must not grey out the whole UI.
-                let can_act = self.phase != Phase::Cleaning;
-                // Collect actions to run after the borrow ends (avoids borrow conflict).
-                let mut request: Option<Pending> = None;
-                let mut rescan_nm = false;
-                let mut pty_action: Option<bool> = None; // Some(persist?)
-                // node_modules selection: snapshot for borrow-safe checkbox rendering.
-                let nm_sel = self.nm_selected.clone();
-                let mut nm_toggles: Vec<PathBuf> = Vec::new();
-                let mut nm_set_all: Option<bool> = None;
-                let mut nm_clear_selected = false;
-                // Docker volume selection snapshot.
-                let dvol_sel = self.dvol_selected.clone();
-                let mut dvol_toggles: Vec<String> = Vec::new();
-                let mut dvol_delete = false;
-                // Docker image selection snapshot.
-                let dimg_sel = self.dimg_selected.clone();
-                let mut dimg_toggles: Vec<String> = Vec::new();
-                let mut dimg_delete = false;
-                let mut dvol_set_all: Option<bool> = None;
-                let mut dimg_set_all: Option<bool> = None;
+                // Deferred effects: collected while rendering, applied after.
+                let mut fx = Effects::default();
 
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    // Pseudo-terminal warning banner (only when near/at the cap).
-                    if let Some(pty) = self.pty {
-                        if pty.level != PtyLevel::Ok {
-                            if let Some(act) = pty_banner(ui, &pty, can_act) {
-                                pty_action = Some(act);
+                // Only a running operation blocks interaction; a background
+                // rescan must not grey out the window.
+                let can_act = self.phase != Phase::Working;
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if let Some(pty) = self.pty {
+                            if pty.level != PtyLevel::Ok {
+                                fx.pty_action = self.pty_notice(ui, &pty, can_act);
+                                ui.add_space(style::SECTION_GAP);
                             }
                         }
-                    }
 
-                    for cat in ALL_CATEGORIES {
-                        // Only show caches with something to clear; skip empties.
-                        let idxs: Vec<usize> = self
-                            .rows
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, r)| &r.category == cat && r.size > 0)
-                            .map(|(i, _)| i)
-                            .collect();
-                        if idxs.is_empty() {
-                            continue;
-                        }
-                        section_header(ui, cat);
-                        card(ui, |ui| {
-                            for (n, i) in idxs.iter().enumerate() {
-                                if n > 0 {
-                                    ui.add_space(2.0);
-                                }
-                                let r = &self.rows[*i];
-                                if let Some(p) = cache_row(ui, r, can_act) {
-                                    request = Some(p);
-                                }
-                            }
-                        });
-                    }
-
-                    // Note how many empty caches are tracked but hidden.
-                    let hidden = self.rows.iter().filter(|r| r.size == 0).count();
-                    if hidden > 0 {
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new(format!("{hidden} empty caches tracked (hidden)"))
-                                .size(10.5)
-                                .color(MUTED),
+                        self.recommended_section(ui, can_act, &mut fx);
+                        ui.add_space(style::SECTION_GAP);
+                        self.cache_groups(ui, can_act, &mut fx);
+                        ui.add_space(style::SECTION_GAP);
+                        self.advanced_section(ui, can_act, &mut fx);
+                        ui.add_space(style::SECTION_GAP);
+                        self.danger_section(ui, can_act, &mut fx);
+                        ui.add_space(style::SECTION_GAP);
+                        w::activity_section(
+                            ui,
+                            &t,
+                            &self.activity,
+                            std::mem::take(&mut self.activity_open),
+                            (self.phase == Phase::Working)
+                                .then(|| (self.status.as_str(), self.elapsed_secs())),
                         );
-                    }
+                        ui.add_space(8.0);
+                    });
 
-                    // Docker — granular prune actions + per-volume management.
-                    if self.docker.is_none() && self.docker_scanning {
-                        section_header(ui, "docker");
-                        ui.horizontal(|ui| {
-                            ui.add(egui::Spinner::new().size(12.0));
-                            ui.label(
-                                RichText::new("querying Docker (docker system df)…")
-                                    .size(11.5)
-                                    .color(MUTED),
-                            );
-                        });
+                // --- apply deferred effects ---
+                for key in std::mem::take(&mut fx.toggles) {
+                    self.toggle(key);
+                }
+                for name in std::mem::take(&mut fx.vol_toggles) {
+                    if !self.vol_selected.remove(&name) {
+                        self.vol_selected.insert(name);
                     }
-                    if let Some(d) = &self.docker {
-                        section_header(ui, "docker");
-                        card(ui, |ui| {
-                            let cats = [
-                                ("builder", "Build cache", d.build_cache),
-                                ("image", "Unused images", d.images),
-                                ("container", "Stopped containers", d.containers),
-                            ];
-                            for (n, (kind, label, size)) in cats.into_iter().enumerate() {
-                                if n > 0 {
-                                    ui.add_space(2.0);
-                                }
-                                if docker_prune_row(ui, label, size, can_act, false) {
-                                    request = Some(Pending::DockerPrune {
-                                        kind,
-                                        label: label.to_string(),
-                                        size,
-                                    });
-                                }
-                            }
-                            // Networks: no size, count-less; offer a plain prune.
-                            ui.add_space(2.0);
-                            if docker_prune_row(ui, "Unused networks", 0, can_act, true) {
-                                request = Some(Pending::DockerPrune {
-                                    kind: "network",
-                                    label: "Unused networks".into(),
-                                    size: 0,
-                                });
-                            }
-                        });
-
-                        // Images — pick exactly which to remove.
-                        if !d.image_list.is_empty() {
-                            let isel_count =
-                                d.image_list.iter().filter(|i| dimg_sel.contains(&i.id)).count();
-                            let isel_total: u64 = d
+                }
+                for id in std::mem::take(&mut fx.img_toggles) {
+                    if !self.img_selected.remove(&id) {
+                        self.img_selected.insert(id);
+                    }
+                }
+                if let Some(all) = fx.img_set_all {
+                    self.img_selected.clear();
+                    if all {
+                        if let Some(d) = &self.docker {
+                            // Bulk selection uses the library rule, so locked
+                            // images can never be swept in.
+                            let items: Vec<Selectable> = d
                                 .image_list
                                 .iter()
-                                .filter(|i| dimg_sel.contains(&i.id))
-                                .map(|i| i.size)
-                                .sum();
-                            let img_selectable =
-                                d.image_list.iter().filter(|i| !i.in_use).count();
-                            let img_all = img_selectable > 0 && isel_count == img_selectable;
-                            ui.add_space(6.0);
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(format!("Images ({})", d.image_list.len()))
-                                        .size(11.0)
-                                        .strong()
-                                        .color(MUTED),
-                                );
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if img_selectable > 0 {
-                                        let lbl = if img_all { "Select none" } else { "Select all" };
-                                        if ui.add(ghost_button(lbl)).clicked() {
-                                            dimg_set_all = Some(!img_all);
-                                        }
-                                    }
-                                });
-                            });
-                            card(ui, |ui| {
-                                for (n, img) in d.image_list.iter().enumerate() {
-                                    if n > 0 {
-                                        ui.add_space(2.0);
-                                    }
-                                    let checked = dimg_sel.contains(&img.id);
-                                    if docker_image_row(ui, img, checked, can_act) {
-                                        dimg_toggles.push(img.id.clone());
-                                    }
-                                }
-                            });
-                            ui.add_space(6.0);
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(if isel_count > 0 {
-                                        format!("{isel_count} selected · {}", human(isel_total))
-                                    } else {
-                                        "Tick images to remove (in-use are locked)".into()
-                                    })
-                                    .size(11.5)
-                                    .color(MUTED),
-                                );
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    let enabled = can_act && isel_count > 0;
-                                    let btn = danger_button(&format!("Remove {isel_count} image(s)"));
-                                    if ui.add_enabled(enabled, btn).clicked() {
-                                        dimg_delete = true;
-                                    }
-                                });
-                            });
-                        }
-
-                        // Volumes (data!) — pick exactly which to delete.
-                        if !d.volumes.is_empty() {
-                            let dsel_count =
-                                d.volumes.iter().filter(|v| dvol_sel.contains(&v.name)).count();
-                            let dsel_total: u64 = d
-                                .volumes
-                                .iter()
-                                .filter(|v| dvol_sel.contains(&v.name))
-                                .map(|v| v.size)
-                                .sum();
-                            let vol_selectable =
-                                d.volumes.iter().filter(|v| !v.in_use).count();
-                            let vol_all = vol_selectable > 0 && dsel_count == vol_selectable;
-                            ui.add_space(6.0);
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("Volumes — contain data; deleting is permanent")
-                                        .size(11.0)
-                                        .strong()
-                                        .color(DANGER),
-                                );
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if vol_selectable > 0 {
-                                        let lbl = if vol_all { "Select none" } else { "Select all" };
-                                        if ui.add(ghost_button(lbl)).clicked() {
-                                            dvol_set_all = Some(!vol_all);
-                                        }
-                                    }
-                                });
-                            });
-                            card(ui, |ui| {
-                                for (n, v) in d.volumes.iter().enumerate() {
-                                    if n > 0 {
-                                        ui.add_space(2.0);
-                                    }
-                                    let checked = dvol_sel.contains(&v.name);
-                                    if docker_volume_row(ui, v, checked, can_act) {
-                                        dvol_toggles.push(v.name.clone());
-                                    }
-                                }
-                            });
-                            ui.add_space(6.0);
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(if dsel_count > 0 {
-                                        format!("{dsel_count} selected · {}", human(dsel_total))
-                                    } else {
-                                        "Tick unused volumes to delete".into()
-                                    })
-                                    .size(11.5)
-                                    .color(MUTED),
-                                );
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    let enabled = can_act && dsel_count > 0;
-                                    let btn = danger_button(&format!("Delete {dsel_count} volume(s)"));
-                                    if ui.add_enabled(enabled, btn).clicked() {
-                                        dvol_delete = true;
-                                    }
-                                });
-                            });
-                        }
-                        ui.label(
-                            RichText::new("Prune frees space inside the VM (keeps running containers). It does not shrink the ~/.colima disk image on your Mac.")
-                                .size(10.5)
-                                .color(MUTED),
-                        );
-                    }
-
-                    // iOS simulators (from extras; Docker is handled above).
-                    let sim_extras: Vec<&(String, u64)> =
-                        self.extras.iter().filter(|(l, _)| !l.contains("Docker")).collect();
-                    if !sim_extras.is_empty() {
-                        section_header(ui, "extras");
-                        card(ui, |ui| {
-                            for (label, size) in sim_extras {
-                                if extra_row(ui, label, *size, "Delete", can_act) {
-                                    request = Some(Pending::Simulators { size: *size });
-                                }
-                            }
-                        });
-                    }
-
-                    // node_modules — discovered project dependency folders.
-                    let sel_count = self.node_modules.iter().filter(|n| nm_sel.contains(&n.path)).count();
-                    let sel_total = self.nm_selected_total();
-                    let all_selected = !self.node_modules.is_empty() && sel_count == self.node_modules.len();
-
-                    ui.add_space(12.0);
-
-                    if self.node_modules.is_empty() {
-                        ui.horizontal(|ui| {
-                            ui.colored_label(NM, RichText::new("●").size(9.0));
-                            ui.label(RichText::new("NODE_MODULES").size(11.5).strong().color(MUTED));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if self.nm_scanning {
-                                    ui.add(egui::Spinner::new().size(12.0));
-                                } else if ui.add(ghost_button("↻ Rescan")).clicked() {
-                                    rescan_nm = true;
-                                }
-                            });
-                        });
-                        let msg = if self.nm_scanning {
-                            "scanning your home folder for node_modules…"
-                        } else {
-                            "none found"
-                        };
-                        ui.label(RichText::new(msg).size(11.5).color(MUTED));
-                    } else {
-                        // Collapsible: the folder list lives in the body; the header
-                        // and the bulk-action bar stay visible even when collapsed.
-                        let id = ui.make_persistent_id("nm_section");
-                        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
-                            .show_header(ui, |ui| {
-                                ui.colored_label(NM, RichText::new("●").size(9.0));
-                                ui.label(RichText::new("NODE_MODULES").size(11.5).strong().color(MUTED));
-                                ui.label(
-                                    RichText::new(format!("· {} · {}", self.node_modules.len(), human(self.nm_total())))
-                                        .size(11.0)
-                                        .color(MUTED),
-                                );
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if self.nm_scanning {
-                                        ui.add(egui::Spinner::new().size(12.0));
-                                    } else {
-                                        if ui.add(ghost_button("↻ Rescan")).clicked() {
-                                            rescan_nm = true;
-                                        }
-                                        let label = if all_selected { "Select none" } else { "Select all" };
-                                        if ui.add(ghost_button(label)).clicked() {
-                                            nm_set_all = Some(!all_selected);
-                                        }
-                                    }
-                                });
-                            })
-                            .body(|ui| {
-                                card(ui, |ui| {
-                                    for (n, nm) in self.node_modules.iter().enumerate() {
-                                        if n > 0 {
-                                            ui.add_space(2.0);
-                                        }
-                                        let checked = nm_sel.contains(&nm.path);
-                                        if nm_row(ui, nm, checked, can_act) {
-                                            nm_toggles.push(nm.path.clone());
-                                        }
-                                    }
-                                });
-                            });
-
-                        ui.add_space(6.0);
-                        // Bulk action bar — always visible, even when collapsed.
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(if sel_count > 0 {
-                                    format!("{sel_count} selected · {}", human(sel_total))
-                                } else {
-                                    "Expand and tick folders to delete in bulk".into()
+                                .map(|i| {
+                                    Selectable::new(i.id.clone(), i.size, Risk::Conditional)
+                                        .locked(i.in_use)
                                 })
-                                .size(11.5)
-                                .color(MUTED),
-                            );
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let enabled = can_act && sel_count > 0;
-                                let btn = danger_button(&format!("Delete {sel_count} selected"));
-                                if ui.add_enabled(enabled, btn).clicked() {
-                                    nm_clear_selected = true;
-                                }
-                            });
-                        });
-                        ui.label(
-                            RichText::new("Safe to delete — rebuild any project later with npm / yarn / pnpm install.")
-                                .size(10.5)
-                                .color(MUTED),
-                        );
-                    }
-
-                    ui.add_space(8.0);
-                });
-
-                // Apply node_modules selection changes after the render borrow ends.
-                for p in nm_toggles {
-                    if !self.nm_selected.remove(&p) {
-                        self.nm_selected.insert(p);
-                    }
-                }
-                if let Some(all) = nm_set_all {
-                    if all {
-                        self.nm_selected = self.node_modules.iter().map(|n| n.path.clone()).collect();
-                    } else {
-                        self.nm_selected.clear();
-                    }
-                }
-                if nm_clear_selected {
-                    let items: Vec<BulkItem> = self
-                        .node_modules
-                        .iter()
-                        .filter(|n| self.nm_selected.contains(&n.path))
-                        .map(|n| BulkItem { label: n.label.clone(), path: n.path.clone(), size: n.size })
-                        .collect();
-                    let total = items.iter().map(|i| i.size).sum();
-                    if !items.is_empty() {
-                        request = Some(Pending::NodeModulesBulk { items, total });
-                    }
-                }
-
-                // Apply Docker volume selection changes.
-                for name in dvol_toggles {
-                    if !self.dvol_selected.remove(&name) {
-                        self.dvol_selected.insert(name);
-                    }
-                }
-                if dvol_delete {
-                    if let Some(d) = &self.docker {
-                        let chosen: Vec<&DockerVolume> = d
-                            .volumes
-                            .iter()
-                            .filter(|v| self.dvol_selected.contains(&v.name))
-                            .collect();
-                        let total = chosen.iter().map(|v| v.size).sum();
-                        let names: Vec<String> = chosen.iter().map(|v| v.name.clone()).collect();
-                        if !names.is_empty() {
-                            request = Some(Pending::DockerVolumes { names, total });
-                        }
-                    }
-                }
-
-                // Docker volume select-all/none (only unlockable, unused ones).
-                if let Some(all) = dvol_set_all {
-                    self.dvol_selected.clear();
-                    if all {
-                        if let Some(d) = &self.docker {
-                            self.dvol_selected = d
-                                .volumes
-                                .iter()
-                                .filter(|v| !v.in_use)
-                                .map(|v| v.name.clone())
                                 .collect();
+                            self.img_selected = bulk_selectable_keys(&items).into_iter().collect();
                         }
                     }
                 }
-
-                // Apply Docker image selection changes.
-                for id in dimg_toggles {
-                    if !self.dimg_selected.remove(&id) {
-                        self.dimg_selected.insert(id);
-                    }
-                }
-                if let Some(all) = dimg_set_all {
-                    self.dimg_selected.clear();
-                    if all {
-                        if let Some(d) = &self.docker {
-                            self.dimg_selected = d
-                                .image_list
-                                .iter()
-                                .filter(|i| !i.in_use)
-                                .map(|i| i.id.clone())
-                                .collect();
-                        }
-                    }
-                }
-                if dimg_delete {
+                if fx.request_images {
                     if let Some(d) = &self.docker {
                         let chosen: Vec<&DockerImage> = d
                             .image_list
                             .iter()
-                            .filter(|i| self.dimg_selected.contains(&i.id))
+                            .filter(|i| !i.in_use && self.img_selected.contains(&i.id))
                             .collect();
-                        let total = chosen.iter().map(|i| i.size).sum();
-                        let ids: Vec<String> = chosen.iter().map(|i| i.id.clone()).collect();
-                        let names: Vec<String> = chosen.iter().map(|i| i.name.clone()).collect();
-                        if !ids.is_empty() {
-                            request = Some(Pending::DockerImages { ids, names, total });
+                        if !chosen.is_empty() {
+                            self.docker_action = Some(DockerAction::RemoveImages {
+                                ids: chosen.iter().map(|i| i.id.clone()).collect(),
+                                names: chosen.iter().map(|i| i.name.clone()).collect(),
+                                total: chosen.iter().map(|i| i.size).sum(),
+                            });
                         }
                     }
                 }
-
-                if let Some(p) = request {
-                    self.pending = Some(p);
+                if fx.request_volumes {
+                    if let Some(d) = &self.docker {
+                        let chosen: Vec<&DockerVolume> = d
+                            .volumes
+                            .iter()
+                            .filter(|v| !v.in_use && self.vol_selected.contains(&v.name))
+                            .collect();
+                        if !chosen.is_empty() {
+                            self.danger_ack = false;
+                            self.danger = Some(Danger::DockerVolumes {
+                                names: chosen.iter().map(|v| v.name.clone()).collect(),
+                                total: chosen.iter().map(|v| v.size).sum(),
+                            });
+                        }
+                    }
                 }
-                if rescan_nm {
+                if fx.rescan_nm {
                     self.start_nm_scan();
                 }
-                if let Some(persist) = pty_action {
+                if let Some(persist) = fx.pty_action {
                     self.run_pty(persist);
                 }
             });
     }
 
-    fn confirm_dialog(&mut self, ctx: &egui::Context) {
-        let Some(pending) = self.pending.clone() else {
+    /// 3. Recommended cleanup — the automatically selected regenerable caches.
+    fn recommended_section(&self, ui: &mut egui::Ui, can_act: bool, fx: &mut Effects) {
+        let t = self.tokens;
+        let rec = self.recommended();
+        ui.horizontal(|ui| {
+            style::section_label(ui, &t, "RECOMMENDED CLEANUP");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let bytes: u64 = rec.iter().map(|r| r.size).sum();
+                if bytes > 0 {
+                    ui.label(
+                        RichText::new(human(bytes))
+                            .size(style::T_LABEL)
+                            .strong()
+                            .color(t.safe),
+                    );
+                }
+            });
+        });
+        ui.add_space(6.0);
+
+        if rec.is_empty() {
+            style::group(ui, &t, |ui| {
+                ui.label(style::body(
+                    &t,
+                    "Nothing to reclaim — your caches are clear.",
+                ));
+                ui.label(style::meta(
+                    &t,
+                    "Caches refill as you build, install and browse. Rescan later.",
+                ));
+            });
+            return;
+        }
+
+        style::group(ui, &t, |ui| {
+            for (n, r) in rec.iter().take(RECOMMENDED_VISIBLE).enumerate() {
+                if n > 0 {
+                    ui.add_space(style::ROW_GAP);
+                }
+                let toggled = w::select_row(
+                    ui,
+                    &t,
+                    RowView {
+                        name: r.desc,
+                        note: None,
+                        size: r.size,
+                        checked: true,
+                        enabled: can_act,
+                        lock_note: None,
+                        details: Some(&r.path.to_string_lossy()),
+                        tint: t.accent,
+                    },
+                );
+                if toggled {
+                    fx.toggles.push(cache_key(r.id));
+                }
+            }
+            let hidden = rec.len().saturating_sub(RECOMMENDED_VISIBLE);
+            if hidden > 0 {
+                let bytes: u64 = rec.iter().skip(RECOMMENDED_VISIBLE).map(|r| r.size).sum();
+                ui.add_space(style::ROW_GAP);
+                ui.label(style::meta(
+                    &t,
+                    format!(
+                        "+{hidden} more selected ({}) — listed in the groups below",
+                        human(bytes)
+                    ),
+                ));
+            }
+        });
+        ui.add_space(6.0);
+        ui.label(style::meta(
+            &t,
+            "Regenerable caches only. Apps rebuild these the next time they need them.",
+        ));
+    }
+
+    /// 4. Cache groups — collapsed unless they hold something selected.
+    fn cache_groups(&self, ui: &mut egui::Ui, can_act: bool, fx: &mut Effects) {
+        let t = self.tokens;
+        let shown: HashSet<&str> = self
+            .recommended()
+            .into_iter()
+            .take(RECOMMENDED_VISIBLE)
+            .map(|r| r.id)
+            .collect();
+
+        for (label, cats) in GROUPS {
+            let rows: Vec<&Row> = self
+                .rows
+                .iter()
+                .filter(|r| cats.contains(&r.category) && r.size > 0 && !shown.contains(r.id))
+                .collect();
+            if rows.is_empty() {
+                continue;
+            }
+            let bytes: u64 = rows.iter().map(|r| r.size).sum();
+            // Open only a group that actually contains a selected item.
+            let has_selected = rows
+                .iter()
+                .any(|r| self.selected.contains(&cache_key(r.id)));
+            w::collapsing_group(
+                ui,
+                &t,
+                w::GroupSpec {
+                    id: label,
+                    title: label,
+                    count: rows.len(),
+                    bytes,
+                    default_open: has_selected,
+                    tint: None,
+                },
+                |ui| {
+                    if *label == "App caches" {
+                        ui.label(style::meta(
+                            &t,
+                            "Left unselected: these re-download the next time you open the app.",
+                        ));
+                        ui.add_space(4.0);
+                    }
+                    for (n, r) in rows.iter().enumerate() {
+                        if n > 0 {
+                            ui.add_space(style::ROW_GAP);
+                        }
+                        let toggled = w::select_row(
+                            ui,
+                            &t,
+                            RowView {
+                                name: r.desc,
+                                note: None,
+                                size: r.size,
+                                checked: self.selected.contains(&cache_key(r.id)),
+                                enabled: can_act,
+                                lock_note: None,
+                                details: Some(&r.path.to_string_lossy()),
+                                tint: t.accent,
+                            },
+                        );
+                        if toggled {
+                            fx.toggles.push(cache_key(r.id));
+                        }
+                    }
+                },
+            );
+            ui.add_space(8.0);
+        }
+
+        let empty = self.rows.iter().filter(|r| r.size == 0).count();
+        if empty > 0 {
+            ui.label(style::meta(
+                &t,
+                format!("{empty} more caches tracked and already empty"),
+            ));
+        }
+    }
+
+    /// 5. Advanced developer cleanup — collapsed, conditional, caution-tinted.
+    fn advanced_section(&self, ui: &mut egui::Ui, can_act: bool, fx: &mut Effects) {
+        let t = self.tokens;
+        let docker_bytes = self
+            .docker
+            .as_ref()
+            .map(|d| d.build_cache + d.images + d.containers)
+            .unwrap_or(0);
+        let nm_bytes: u64 = self.node_modules.iter().map(|n| n.size).sum();
+        let count = self
+            .docker
+            .as_ref()
+            .map(|d| docker_prune_kinds(d).len())
+            .unwrap_or(0)
+            + self.node_modules.len()
+            + usize::from(self.sims > 0);
+
+        w::collapsing_group(
+            ui,
+            &t,
+            w::GroupSpec {
+                id: "advanced",
+                title: "Advanced developer cleanup",
+                count,
+                bytes: docker_bytes + nm_bytes + self.sims,
+                default_open: false,
+                tint: Some(t.caution),
+            },
+            |ui| {
+                ui.label(style::meta(
+                    &t,
+                    "Safe in most setups, but worth a deliberate choice — these are rebuilt by \
+                     your tools, not by macOS.",
+                ));
+                ui.add_space(8.0);
+
+                // Docker prune categories.
+                if self.docker.is_none() {
+                    ui.horizontal(|ui| {
+                        if self.docker_scanning {
+                            ui.add(egui::Spinner::new().size(12.0).color(t.text_muted));
+                            ui.label(style::meta(&t, "querying Docker (docker system df)…"));
+                        } else {
+                            ui.label(style::meta(&t, "Docker is not reachable — skipped."));
+                        }
+                    });
+                } else if let Some(d) = &self.docker {
+                    style::section_label(ui, &t, "DOCKER");
+                    ui.add_space(4.0);
+                    for (n, (kind, label, size)) in docker_prune_kinds(d).into_iter().enumerate() {
+                        if n > 0 {
+                            ui.add_space(style::ROW_GAP);
+                        }
+                        let key = docker_key(kind);
+                        let note = match kind {
+                            "builder" => Some("Rebuilt on your next docker build"),
+                            "image" => Some("Re-pulled or rebuilt when next needed"),
+                            "network" => Some("Recreated by compose when needed"),
+                            _ => None,
+                        };
+                        let toggled = w::select_row(
+                            ui,
+                            &t,
+                            RowView {
+                                name: label,
+                                note,
+                                size,
+                                checked: self.selected.contains(&key),
+                                enabled: can_act,
+                                lock_note: None,
+                                details: None,
+                                tint: t.caution,
+                            },
+                        );
+                        if toggled {
+                            fx.toggles.push(key);
+                        }
+                    }
+                    ui.add_space(6.0);
+                    ui.label(style::meta(
+                        &t,
+                        "Pruning frees space inside the Docker VM and keeps running containers. \
+                         It does not shrink the ~/.colima disk image on your Mac.",
+                    ));
+
+                    // Per-image removal keeps its own list and action: it needs
+                    // image ids, and "Remove" is the honest verb for it.
+                    if !d.image_list.is_empty() {
+                        ui.add_space(10.0);
+                        let selectable = d.image_list.iter().filter(|i| !i.in_use).count();
+                        let sel: Vec<&DockerImage> = d
+                            .image_list
+                            .iter()
+                            .filter(|i| !i.in_use && self.img_selected.contains(&i.id))
+                            .collect();
+                        let all = selectable > 0 && sel.len() == selectable;
+                        ui.horizontal(|ui| {
+                            style::section_label(
+                                ui,
+                                &t,
+                                &format!("IMAGES ({})", d.image_list.len()),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if selectable > 0 {
+                                        let lbl = if all { "Select none" } else { "Select all" };
+                                        if ui.add(style::quiet_button(&t, lbl)).clicked() {
+                                            fx.img_set_all = Some(!all);
+                                        }
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_space(4.0);
+                        for (n, img) in d.image_list.iter().enumerate() {
+                            if n > 0 {
+                                ui.add_space(style::ROW_GAP);
+                            }
+                            let toggled = w::select_row(
+                                ui,
+                                &t,
+                                RowView {
+                                    name: &img.name,
+                                    note: None,
+                                    size: img.size,
+                                    checked: self.img_selected.contains(&img.id),
+                                    enabled: can_act && !img.in_use,
+                                    lock_note: Some("in use"),
+                                    details: Some(&img.id),
+                                    tint: t.caution,
+                                },
+                            );
+                            if toggled {
+                                fx.img_toggles.push(img.id.clone());
+                            }
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            let total: u64 = sel.iter().map(|i| i.size).sum();
+                            ui.label(style::meta(
+                                &t,
+                                if sel.is_empty() {
+                                    "Select unused images to remove".to_string()
+                                } else {
+                                    format!(
+                                        "{} image{} · {}",
+                                        sel.len(),
+                                        w::plural(sel.len()),
+                                        human(total)
+                                    )
+                                },
+                            ));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let enabled = can_act && !sel.is_empty();
+                                    let btn = style::primary_button(
+                                        &t,
+                                        &format!(
+                                            "Remove {} image{}",
+                                            sel.len(),
+                                            w::plural(sel.len())
+                                        ),
+                                    );
+                                    let resp = ui.add_enabled(enabled, btn);
+                                    if resp.clicked() {
+                                        fx.request_images = true;
+                                    }
+                                    if !enabled {
+                                        resp.on_disabled_hover_text(
+                                            "Tick at least one unused image",
+                                        );
+                                    }
+                                },
+                            );
+                        });
+                    }
+                }
+
+                // node_modules.
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    style::section_label(ui, &t, "NODE_MODULES");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.nm_scanning {
+                            ui.add(egui::Spinner::new().size(12.0).color(t.text_muted));
+                        } else if ui.add(style::quiet_button(&t, "Rescan")).clicked() {
+                            fx.rescan_nm = true;
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                if self.node_modules.is_empty() {
+                    ui.label(style::meta(
+                        &t,
+                        if self.nm_scanning {
+                            "looking for node_modules folders…"
+                        } else {
+                            "none found"
+                        },
+                    ));
+                } else {
+                    for (n, nm) in self.node_modules.iter().take(12).enumerate() {
+                        if n > 0 {
+                            ui.add_space(style::ROW_GAP);
+                        }
+                        let key = nm_key(&nm.path);
+                        let toggled = w::select_row(
+                            ui,
+                            &t,
+                            RowView {
+                                name: &nm.label,
+                                note: None,
+                                size: nm.size,
+                                checked: self.selected.contains(&key),
+                                enabled: can_act,
+                                lock_note: None,
+                                details: Some(&nm.path.to_string_lossy()),
+                                tint: t.caution,
+                            },
+                        );
+                        if toggled {
+                            fx.toggles.push(key);
+                        }
+                    }
+                    if self.node_modules.len() > 12 {
+                        ui.add_space(style::ROW_GAP);
+                        ui.label(style::meta(
+                            &t,
+                            format!(
+                                "{} more folders found — the largest are listed first",
+                                self.node_modules.len() - 12
+                            ),
+                        ));
+                    }
+                    ui.add_space(6.0);
+                    ui.label(style::meta(
+                        &t,
+                        "Rebuild any project later with npm / yarn / pnpm install.",
+                    ));
+                }
+
+                // iOS simulators.
+                if self.sims > 0 {
+                    ui.add_space(12.0);
+                    style::section_label(ui, &t, "IOS SIMULATORS");
+                    ui.add_space(4.0);
+                    let toggled = w::select_row(
+                        ui,
+                        &t,
+                        RowView {
+                            name: "Unavailable simulator runtimes",
+                            note: Some("Removed with xcrun simctl delete unavailable"),
+                            size: self.sims,
+                            checked: self.selected.contains("sims"),
+                            enabled: can_act,
+                            lock_note: None,
+                            details: None,
+                            tint: t.caution,
+                        },
+                    );
+                    if toggled {
+                        fx.toggles.push("sims".to_string());
+                    }
+                }
+            },
+        );
+    }
+
+    /// 6. Irreversible cleanup — data-bearing, never bulk-selected.
+    fn danger_section(&self, ui: &mut egui::Ui, can_act: bool, fx: &mut Effects) {
+        let t = self.tokens;
+        let Some(d) = &self.docker else { return };
+        if d.volumes.is_empty() {
+            return;
+        }
+        let total: u64 = d.volumes.iter().map(|v| v.size).sum();
+        w::collapsing_group(
+            ui,
+            &t,
+            w::GroupSpec {
+                id: "danger",
+                title: "Irreversible cleanup",
+                count: d.volumes.len(),
+                bytes: total,
+                default_open: false,
+                tint: Some(t.danger),
+            },
+            |ui| {
+                ui.label(
+                    RichText::new(
+                        "Docker volumes hold real data — databases, uploads, anything a container \
+                         wrote. Deleting one cannot be undone, and nothing here is ever included \
+                         in Review & Clean.",
+                    )
+                    .size(style::T_META)
+                    .color(t.text_secondary),
+                );
+                ui.add_space(8.0);
+                let sel: Vec<&DockerVolume> = d
+                    .volumes
+                    .iter()
+                    .filter(|v| !v.in_use && self.vol_selected.contains(&v.name))
+                    .collect();
+                for (n, v) in d.volumes.iter().enumerate() {
+                    if n > 0 {
+                        ui.add_space(style::ROW_GAP);
+                    }
+                    let toggled = w::select_row(
+                        ui,
+                        &t,
+                        RowView {
+                            name: &v.name,
+                            note: None,
+                            size: v.size,
+                            checked: self.vol_selected.contains(&v.name),
+                            enabled: can_act && !v.in_use,
+                            lock_note: Some("mounted"),
+                            details: Some(&v.name),
+                            tint: t.danger,
+                        },
+                    );
+                    if toggled {
+                        fx.vol_toggles.push(v.name.clone());
+                    }
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let bytes: u64 = sel.iter().map(|v| v.size).sum();
+                    ui.label(style::meta(
+                        &t,
+                        if sel.is_empty() {
+                            "Select a volume to delete it permanently".to_string()
+                        } else {
+                            format!(
+                                "{} volume{} · {}",
+                                sel.len(),
+                                w::plural(sel.len()),
+                                human(bytes)
+                            )
+                        },
+                    ));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let enabled = can_act && !sel.is_empty();
+                        let resp =
+                            ui.add_enabled(enabled, style::danger_button(&t, "Delete permanently"));
+                        if resp.clicked() {
+                            fx.request_volumes = true;
+                        }
+                        if !enabled {
+                            resp.on_disabled_hover_text(
+                                "Tick an unused volume — mounted volumes cannot be deleted",
+                            );
+                        }
+                    });
+                });
+            },
+        );
+    }
+
+    /// The macOS pty-exhaustion notice. Not cleanup: a system limit with a fix.
+    fn pty_notice(&self, ui: &mut egui::Ui, pty: &PtyStatus, can_act: bool) -> Option<bool> {
+        let t = self.tokens;
+        let mut action = None;
+        let critical = pty.level == PtyLevel::Critical;
+        let tint = if critical { t.danger } else { t.caution };
+        style::tinted_group(ui, &t, tint, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(if critical {
+                        "Terminal limit reached"
+                    } else {
+                        "Terminal slots running low"
+                    })
+                    .size(style::T_BODY)
+                    .strong()
+                    .color(tint),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!("{} / {}", pty.nodes, pty.cap))
+                            .size(style::T_META)
+                            .monospace()
+                            .color(tint),
+                    );
+                });
+            });
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "Old terminal devices pile up over long uptimes and aren't freed by closing \
+                     apps. At the cap, new shells fail with \"Device not configured\". Raising the \
+                     limit fixes it immediately — no restart.",
+                )
+                .size(style::T_META)
+                .color(t.text_secondary),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        can_act,
+                        style::primary_button(&t, &format!("Raise limit to {PTY_TARGET}")),
+                    )
+                    .clicked()
+                {
+                    action = Some(false);
+                }
+                if ui
+                    .add_enabled(can_act, style::quiet_button(&t, "Make permanent"))
+                    .clicked()
+                {
+                    action = Some(true);
+                }
+                ui.label(style::meta(&t, "asks for your Mac password"));
+            });
+        });
+        action
+    }
+
+    /// 3 (GUI spec) — the review step for the safe batch.
+    fn review_dialog(&mut self, ctx: &egui::Context) {
+        let Some(review) = self.review.clone() else {
             return;
         };
-        let (title, body, freed) = match &pending {
-            Pending::Cache { desc, size, .. } => (
-                "Clear cache",
-                format!("Clear “{desc}” and reclaim {}?", human(*size)),
-                *size,
-            ),
-            Pending::DockerPrune { label, size, .. } => (
-                "Prune Docker",
-                if *size > 0 {
-                    format!("Prune {} (~{})? Running containers + volumes are kept.", label.to_lowercase(), human(*size))
-                } else {
-                    format!("Prune {}? Running containers + volumes are kept.", label.to_lowercase())
-                },
-                *size,
-            ),
-            Pending::DockerVolumes { names, total } => (
-                "Delete Docker volumes",
-                format!(
-                    "⚠ Permanently delete {} volume{} and ALL their data ({})?\n\nThis cannot be undone.",
-                    names.len(),
-                    if names.len() == 1 { "" } else { "s" },
-                    human(*total)
-                ),
-                *total,
-            ),
-            Pending::DockerImages { ids, total, .. } => (
-                "Remove Docker images",
-                format!(
-                    "Remove {} image{} ({})? They'll re-pull/rebuild when next needed.",
-                    ids.len(),
-                    if ids.len() == 1 { "" } else { "s" },
-                    human(*total)
-                ),
-                *total,
-            ),
-            Pending::Simulators { size } => (
-                "Delete simulators",
-                format!("Delete unavailable iOS simulators (~{})?", human(*size)),
-                *size,
-            ),
-            Pending::NodeModulesBulk { items, total } => (
-                "Delete node_modules",
-                format!(
-                    "Delete {} node_modules folder{} and reclaim {}?\n\nRebuild later with npm / yarn / pnpm install.",
-                    items.len(),
-                    if items.len() == 1 { "" } else { "s" },
-                    human(*total)
-                ),
-                *total,
-            ),
-        };
-
-        // Dim the backdrop for a modal feel.
-        egui::Area::new(egui::Id::new("backdrop"))
-            .order(egui::Order::Background)
-            .show(ctx, |ui| {
-                let r = ui.max_rect();
-                ui.painter()
-                    .rect_filled(r, 0.0, Color32::from_black_alpha(120));
-            });
-
-        let mut close = false;
+        let t = self.tokens;
+        w::backdrop(ctx);
         let mut confirm = false;
-        egui::Window::new(title)
+        let mut cancel = false;
+        egui::Window::new("Review cleanup")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .frame(
                 egui::Frame::default()
-                    .fill(CARD)
-                    .rounding(Rounding::same(12.0))
-                    .inner_margin(Margin::same(18.0))
-                    .stroke(egui::Stroke::new(1.0, Color32::from_rgb(0x3a, 0x3f, 0x4c))),
+                    .fill(t.surface)
+                    .rounding(egui::Rounding::same(12.0))
+                    .inner_margin(egui::Margin::same(18.0))
+                    .stroke(egui::Stroke::new(1.0, t.divider)),
             )
             .show(ctx, |ui| {
-                ui.set_max_width(360.0);
-                ui.label(RichText::new(body).size(13.5).color(TEXT));
-                let _ = freed;
-                // For bulk node_modules, list exactly what will be deleted.
-                if let Pending::NodeModulesBulk { items, .. } = &pending {
-                    ui.add_space(8.0);
-                    egui::Frame::default()
-                        .fill(Color32::from_rgb(0x10, 0x12, 0x16))
-                        .rounding(Rounding::same(8.0))
-                        .inner_margin(Margin::symmetric(10.0, 8.0))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            egui::ScrollArea::vertical()
-                                .max_height(160.0)
-                                .show(ui, |ui| {
-                                    for it in items {
-                                        ui.horizontal(|ui| {
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(&it.label)
-                                                        .size(11.0)
-                                                        .monospace()
-                                                        .color(MUTED),
-                                                )
-                                                .truncate(),
-                                            );
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    ui.label(
-                                                        RichText::new(human(it.size))
-                                                            .size(11.0)
-                                                            .monospace()
-                                                            .color(MUTED),
-                                                    );
-                                                },
-                                            );
-                                        });
-                                    }
-                                });
+                ui.set_max_width(390.0);
+                ui.label(
+                    RichText::new(format!("{} to reclaim", human(review.estimate)))
+                        .size(22.0)
+                        .strong()
+                        .color(t.safe),
+                );
+                ui.add_space(10.0);
+                for (label, count, bytes) in &review.groups {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(label).size(style::T_BODY).color(t.text));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(style::meta(
+                                &t,
+                                format!("{count} item{} · {}", w::plural(*count), human(*bytes)),
+                            ));
                         });
+                    });
                 }
-                // For volume deletion, list the volume names being destroyed.
-                if let Pending::DockerVolumes { names, .. } = &pending {
-                    ui.add_space(8.0);
-                    egui::Frame::default()
-                        .fill(Color32::from_rgb(0x10, 0x12, 0x16))
-                        .rounding(Rounding::same(8.0))
-                        .inner_margin(Margin::symmetric(10.0, 8.0))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            egui::ScrollArea::vertical()
-                                .max_height(160.0)
-                                .show(ui, |ui| {
-                                    for name in names {
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(name)
-                                                    .size(11.0)
-                                                    .monospace()
-                                                    .color(MUTED),
-                                            )
-                                            .truncate(),
-                                        );
-                                    }
-                                });
-                        });
-                }
-                // For image removal, list the image names.
-                if let Pending::DockerImages { names, .. } = &pending {
-                    ui.add_space(8.0);
-                    egui::Frame::default()
-                        .fill(Color32::from_rgb(0x10, 0x12, 0x16))
-                        .rounding(Rounding::same(8.0))
-                        .inner_margin(Margin::symmetric(10.0, 8.0))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            egui::ScrollArea::vertical()
-                                .max_height(160.0)
-                                .show(ui, |ui| {
-                                    for name in names {
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(name)
-                                                    .size(11.0)
-                                                    .monospace()
-                                                    .color(MUTED),
-                                            )
-                                            .truncate(),
-                                        );
-                                    }
-                                });
-                        });
-                }
+                ui.add_space(10.0);
+                style::divider(ui, &t);
+                ui.add_space(10.0);
+                let lines: Vec<(String, Option<u64>)> = review
+                    .jobs
+                    .iter()
+                    .map(|j| {
+                        let size = j.size();
+                        (j.label(), (size > 0).then_some(size))
+                    })
+                    .collect();
+                w::item_manifest(ui, &t, &lines);
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new(
+                        "These are regenerable caches: your tools rebuild them the next time they \
+                         need them, so they may reappear later. No documents, projects or Git \
+                         repositories are touched.",
+                    )
+                    .size(style::T_META)
+                    .color(t.text_secondary),
+                );
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
-                    if ui.add(ghost_button("Cancel")).clicked() {
-                        close = true;
+                    if ui.add(style::quiet_button(&t, "Cancel")).clicked() {
+                        cancel = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add(danger_button("Clear")).clicked() {
+                        let label = if review.estimate > 0 {
+                            format!("Clean {}", human(review.estimate))
+                        } else {
+                            "Clean selected".to_string()
+                        };
+                        if ui.add(style::primary_button(&t, &label)).clicked() {
                             confirm = true;
                         }
                     });
@@ -1405,328 +1756,168 @@ impl App {
             });
 
         if confirm {
-            self.pending = None;
-            self.run_pending(pending);
-        } else if close {
-            self.pending = None;
+            self.review = None;
+            self.run_jobs(review.jobs, review.estimate);
+        } else if cancel {
+            self.review = None;
+        }
+    }
+
+    /// The separate, explicit path for irreversible deletion.
+    fn danger_dialog(&mut self, ctx: &egui::Context) {
+        let Some(danger) = self.danger.clone() else {
+            return;
+        };
+        let t = self.tokens;
+        w::backdrop(ctx);
+        let mut confirm = false;
+        let mut cancel = false;
+        let Danger::DockerVolumes { names, total } = &danger;
+        egui::Window::new("Delete volumes permanently")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(
+                egui::Frame::default()
+                    .fill(t.surface)
+                    .rounding(egui::Rounding::same(12.0))
+                    .inner_margin(egui::Margin::same(18.0))
+                    .stroke(egui::Stroke::new(1.5, t.danger.gamma_multiply(0.7))),
+            )
+            .show(ctx, |ui| {
+                ui.set_max_width(390.0);
+                ui.label(
+                    RichText::new(format!(
+                        "Permanently delete {} volume{}",
+                        names.len(),
+                        w::plural(names.len())
+                    ))
+                    .size(17.0)
+                    .strong()
+                    .color(t.danger),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!(
+                        "This destroys {} of container data — databases, uploads and anything else \
+                         written to these volumes. It cannot be undone, and nothing rebuilds it.",
+                        human(*total)
+                    ))
+                    .size(style::T_BODY)
+                    .color(t.text),
+                );
+                ui.add_space(10.0);
+                let lines: Vec<(String, Option<u64>)> =
+                    names.iter().map(|n| (n.clone(), None)).collect();
+                w::item_manifest(ui, &t, &lines);
+                ui.add_space(12.0);
+                ui.checkbox(
+                    &mut self.danger_ack,
+                    RichText::new("I understand this data cannot be recovered")
+                        .size(style::T_META)
+                        .color(t.text_secondary),
+                );
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    if ui.add(style::quiet_button(&t, "Cancel")).clicked() {
+                        cancel = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let resp = ui.add_enabled(
+                            self.danger_ack,
+                            style::danger_button(&t, "Delete permanently"),
+                        );
+                        if resp.clicked() {
+                            confirm = true;
+                        }
+                        if !self.danger_ack {
+                            resp.on_disabled_hover_text(
+                                "Tick the box above to confirm you understand",
+                            );
+                        }
+                    });
+                });
+            });
+
+        if confirm {
+            self.danger = None;
+            self.danger_ack = false;
+            self.run_danger(danger);
+        } else if cancel {
+            self.danger = None;
+            self.danger_ack = false;
+        }
+    }
+
+    /// Confirmation for removing selected Docker images (regenerable, so this
+    /// is the ordinary accent path — not the danger one).
+    fn docker_action_dialog(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.docker_action.clone() else {
+            return;
+        };
+        let t = self.tokens;
+        w::backdrop(ctx);
+        let mut confirm = false;
+        let mut cancel = false;
+        let DockerAction::RemoveImages { names, total, .. } = &action;
+        egui::Window::new("Remove images")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(
+                egui::Frame::default()
+                    .fill(t.surface)
+                    .rounding(egui::Rounding::same(12.0))
+                    .inner_margin(egui::Margin::same(18.0))
+                    .stroke(egui::Stroke::new(1.0, t.divider)),
+            )
+            .show(ctx, |ui| {
+                ui.set_max_width(390.0);
+                ui.label(
+                    RichText::new(format!("Remove {}", human(*total)))
+                        .size(20.0)
+                        .strong()
+                        .color(t.safe),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "These images are not used by any container. Docker re-pulls or rebuilds \
+                         them the next time something needs them.",
+                    )
+                    .size(style::T_META)
+                    .color(t.text_secondary),
+                );
+                ui.add_space(10.0);
+                let lines: Vec<(String, Option<u64>)> =
+                    names.iter().map(|n| (n.clone(), None)).collect();
+                w::item_manifest(ui, &t, &lines);
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    if ui.add(style::quiet_button(&t, "Cancel")).clicked() {
+                        cancel = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let label =
+                            format!("Remove {} image{}", names.len(), w::plural(names.len()));
+                        if ui.add(style::primary_button(&t, &label)).clicked() {
+                            confirm = true;
+                        }
+                    });
+                });
+            });
+
+        if confirm {
+            self.docker_action = None;
+            self.run_docker_action(action);
+        } else if cancel {
+            self.docker_action = None;
         }
     }
 }
 
-// --- widgets -------------------------------------------------------------
-
-fn section_header(ui: &mut egui::Ui, cat: &str) {
-    ui.add_space(10.0);
-    ui.horizontal(|ui| {
-        ui.colored_label(category_color(cat), RichText::new("●").size(9.0));
-        let label = if cat == "app" {
-            "app · re-downloads".to_string()
-        } else {
-            cat.to_uppercase()
-        };
-        ui.label(RichText::new(label).size(11.5).strong().color(MUTED));
-    });
-    ui.add_space(2.0);
-}
-
-fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    egui::Frame::default()
-        .fill(CARD)
-        .rounding(Rounding::same(10.0))
-        .inner_margin(Margin::symmetric(12.0, 10.0))
-        .show(ui, add)
-        .inner
-}
-
-/// One cache row. Returns `Some(Pending)` when its Clear button is clicked.
-fn cache_row(ui: &mut egui::Ui, r: &Row, can_act: bool) -> Option<Pending> {
-    let mut out = None;
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(r.desc)
-                .size(13.0)
-                .color(if r.size > 0 { TEXT } else { MUTED }),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if r.size > 0 {
-                if ui.add_enabled(can_act, danger_button("Clear")).clicked() {
-                    out = Some(Pending::Cache {
-                        id: r.id,
-                        desc: r.desc.to_string(),
-                        size: r.size,
-                        path: r.path.clone(),
-                    });
-                }
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(human(r.size))
-                        .size(12.5)
-                        .monospace()
-                        .color(TEXT),
-                );
-            } else {
-                ui.label(RichText::new("empty").size(11.5).color(MUTED));
-            }
-        });
-    });
-    out
-}
-
-/// One extras row (Docker / simulators). Returns true when its button clicks.
-fn extra_row(ui: &mut egui::Ui, label: &str, size: u64, verb: &str, can_act: bool) -> bool {
-    let mut clicked = false;
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(label)
-                .size(13.0)
-                .color(if size > 0 { TEXT } else { MUTED }),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if size > 0 {
-                if ui.add_enabled(can_act, accent_button(verb)).clicked() {
-                    clicked = true;
-                }
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(human(size))
-                        .size(12.5)
-                        .monospace()
-                        .color(TEXT),
-                );
-            } else {
-                ui.label(RichText::new("—").size(12.0).color(MUTED));
-            }
-        });
-    });
-    clicked
-}
-
-/// One Docker prune category row. Returns true when "Prune" is clicked.
-/// `allow_empty` lets count-less actions (networks) stay clickable at size 0.
-fn docker_prune_row(
-    ui: &mut egui::Ui,
-    label: &str,
-    size: u64,
-    can_act: bool,
-    allow_empty: bool,
-) -> bool {
-    let mut clicked = false;
-    let actionable = size > 0 || allow_empty;
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(label)
-                .size(13.0)
-                .color(if actionable { TEXT } else { MUTED }),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .add_enabled(can_act && actionable, accent_button("Prune"))
-                .clicked()
-            {
-                clicked = true;
-            }
-            ui.add_space(8.0);
-            let txt = if size > 0 {
-                human(size)
-            } else {
-                "—".to_string()
-            };
-            ui.label(
-                RichText::new(txt)
-                    .size(12.5)
-                    .monospace()
-                    .color(if size > 0 { TEXT } else { MUTED }),
-            );
-        });
-    });
-    clicked
-}
-
-/// One Docker volume row with a checkbox. In-use volumes are locked (can't be
-/// removed while a container mounts them). Returns true when the box toggles.
-fn docker_volume_row(ui: &mut egui::Ui, v: &DockerVolume, checked: bool, can_act: bool) -> bool {
-    let mut toggled = false;
-    let selectable = can_act && !v.in_use;
-    ui.horizontal(|ui| {
-        let mut c = checked;
-        if ui
-            .add_enabled(selectable, egui::Checkbox::new(&mut c, ""))
-            .changed()
-        {
-            toggled = true;
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(
-                RichText::new(human(v.size))
-                    .size(12.5)
-                    .monospace()
-                    .color(TEXT),
-            );
-            ui.add_space(8.0);
-            if v.in_use {
-                ui.label(RichText::new("in use").size(10.5).color(AMBER));
-                ui.add_space(6.0);
-            }
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                let color = if v.in_use { MUTED } else { TEXT };
-                ui.add(egui::Label::new(RichText::new(&v.name).size(12.0).color(color)).truncate());
-            });
-        });
-    });
-    toggled
-}
-
-/// One Docker image row with a checkbox. In-use images are locked (a container
-/// references them). Returns true when the box toggles.
-fn docker_image_row(ui: &mut egui::Ui, img: &DockerImage, checked: bool, can_act: bool) -> bool {
-    let mut toggled = false;
-    let selectable = can_act && !img.in_use;
-    ui.horizontal(|ui| {
-        let mut c = checked;
-        if ui
-            .add_enabled(selectable, egui::Checkbox::new(&mut c, ""))
-            .changed()
-        {
-            toggled = true;
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(
-                RichText::new(human(img.size))
-                    .size(12.5)
-                    .monospace()
-                    .color(TEXT),
-            );
-            ui.add_space(8.0);
-            if img.in_use {
-                ui.label(RichText::new("in use").size(10.5).color(AMBER));
-                ui.add_space(6.0);
-            }
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                let color = if img.in_use { MUTED } else { TEXT };
-                ui.add(
-                    egui::Label::new(RichText::new(&img.name).size(12.0).color(color)).truncate(),
-                );
-            });
-        });
-    });
-    toggled
-}
-
-/// One node_modules row with a checkbox. Returns true when the checkbox toggles.
-fn nm_row(ui: &mut egui::Ui, nm: &NodeModules, checked: bool, can_act: bool) -> bool {
-    let mut toggled = false;
-    ui.horizontal(|ui| {
-        let mut c = checked;
-        if ui
-            .add_enabled(can_act, egui::Checkbox::new(&mut c, ""))
-            .changed()
-        {
-            toggled = true;
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(
-                RichText::new(human(nm.size))
-                    .size(12.5)
-                    .monospace()
-                    .color(TEXT),
-            );
-            ui.add_space(8.0);
-            // Path fills the remaining space, truncated with an ellipsis.
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                let color = if checked { TEXT } else { MUTED };
-                ui.add(
-                    egui::Label::new(RichText::new(&nm.label).size(12.0).color(color)).truncate(),
-                );
-            });
-        });
-    });
-    toggled
-}
-
-/// Pseudo-terminal warning banner. Returns `Some(persist?)` when an action is
-/// clicked: `Some(false)` = raise now, `Some(true)` = raise + persist.
-fn pty_banner(ui: &mut egui::Ui, pty: &PtyStatus, can_act: bool) -> Option<bool> {
-    let mut action = None;
-    let critical = pty.level == PtyLevel::Critical;
-    let accent = if critical { DANGER } else { AMBER };
-    let title = if critical {
-        "⚠ macOS terminal limit reached"
-    } else {
-        "⚠ macOS terminal slots running low"
-    };
-
-    egui::Frame::default()
-        .fill(accent.gamma_multiply(0.14))
-        .rounding(Rounding::same(10.0))
-        .inner_margin(Margin::symmetric(12.0, 10.0))
-        .stroke(egui::Stroke::new(1.0, accent.gamma_multiply(0.6)))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(title).size(13.0).strong().color(accent));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(format!("{} / {} nodes", pty.nodes, pty.cap))
-                            .size(12.0)
-                            .monospace()
-                            .color(accent),
-                    );
-                });
-            });
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(
-                    "Old terminal device nodes pile up over long uptimes and aren't freed by \
-                     closing apps. Once they hit the cap, new shells fail with \"Device not \
-                     configured.\" Raising the limit fixes it instantly — no restart.",
-                )
-                .size(11.5)
-                .color(TEXT),
-            );
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        can_act,
-                        accent_button(&format!("Raise limit ({PTY_TARGET})")),
-                    )
-                    .clicked()
-                {
-                    action = Some(false);
-                }
-                if ui
-                    .add_enabled(can_act, ghost_button("Make permanent"))
-                    .clicked()
-                {
-                    action = Some(true);
-                }
-                ui.label(
-                    RichText::new("requires your Mac password")
-                        .size(10.5)
-                        .color(MUTED),
-                );
-            });
-        });
-    ui.add_space(4.0);
-    action
-}
-
-fn danger_button(text: &str) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text).size(12.0).color(Color32::WHITE)).fill(DANGER)
-}
-
-fn accent_button(text: &str) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text).size(12.0).color(Color32::WHITE)).fill(ACCENT)
-}
-
-fn ghost_button(text: &str) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text).size(12.0).color(TEXT))
-        .fill(CARD_HOVER)
-        .stroke(egui::Stroke::NONE)
-}
-
-/// Run an external command, forwarding each stdout/stderr line to the UI as a
-/// `Msg::Log` so progress is visible live. Blocks until the command exits.
+/// Run an external command, forwarding each stdout/stderr line to the UI so
+/// progress is visible live. Blocks until the command exits.
 fn stream(tx: &Sender<Msg>, ctx: &egui::Context, prog: &str, args: &[&str]) {
     let mut child = match Command::new(prog)
         .args(args)
@@ -1736,7 +1927,7 @@ fn stream(tx: &Sender<Msg>, ctx: &egui::Context, prog: &str, args: &[&str]) {
     {
         Ok(c) => c,
         Err(e) => {
-            let _ = tx.send(Msg::Log(format!("✗ could not run {prog}: {e}")));
+            let _ = tx.send(Msg::Log(format!("could not run {prog}: {e}")));
             ctx.request_repaint();
             return;
         }

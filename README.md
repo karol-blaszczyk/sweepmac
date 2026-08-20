@@ -5,16 +5,18 @@ themselves on next use), reports how much space each is holding, and clears the
 ones you pick.
 
 **Safe by default** — running it just *scans*. Nothing is deleted unless you
-pass `--clean` (CLI) or confirm in the dialog (GUI). Documents, projects, and
-git repos are never scanned.
+pass `--clean` (CLI) or confirm in the review dialog (GUI). Documents, projects,
+and git repos are never scanned. Anything that would destroy data — Docker
+volumes — is quarantined in its own confirmation path and is never bulk-selected.
 
 Ships as three front-ends over one shared core (`src/lib.rs`):
 
 - **CLI** (`sweepmac`) — zero dependencies, Rust std only.
 - **GUI** (`sweepmac-gui`) — a native window built with
   [egui/eframe](https://github.com/emilk/egui), opt-in behind the `gui` feature.
-- **Menu bar** (`sweepmac-tray`) — a 🧹 icon in the macOS top-right status bar
-  with a dropdown of one-click actions, built with
+- **Menu bar** (`sweepmac-tray`) — a monochrome broom glyph in the macOS
+  top-right status bar that reports what's reclaimable and hands cleanup to the
+  window's review step, built with
   [tray-icon](https://github.com/tauri-apps/tray-icon) + tao, opt-in behind the
   `tray` feature.
 
@@ -73,11 +75,18 @@ cargo install --path . --features "gui tray"
 sweepmac-tray
 ```
 
-Adds a 🧹 icon to the macOS menu bar. Click it for a dropdown showing
-reclaimable space (total + safe subset) and one-click actions: clean safe
-caches, clean all (incl. app caches), prune Docker, delete old simulators,
-rescan, or open the full window. Scans/cleans run off the main thread so the
-menu never blocks.
+Adds a monochrome broom glyph to the macOS menu bar — a proper template image,
+so macOS tints it for light and dark menu bars automatically
+([assets/tray](assets/tray)). Its dropdown is deliberately small:
+
+- `{amount} safely reclaimable` and `{free} free of {total}` — status only.
+- **Scan now** — measures; never deletes.
+- **Review recommended cleanup…** — opens the window on its review step.
+- **Open sweepmac** / **Quit**.
+
+The menu bar never deletes anything on its own: every cleanup goes through the
+window's review step. Scanning runs off the main thread so the menu never
+blocks.
 
 > Run straight from the terminal it works, but also shows a Dock icon. To make
 > it a pure background menu-bar app (no Dock icon) and launch it at login, wrap
@@ -90,21 +99,34 @@ menu never blocks.
 sweepmac-gui
 ```
 
-A single window: caches grouped by category with checkboxes and sizes,
-default-safe categories pre-checked, app caches left unchecked. A running
-"Selected" total and a red **Clean selected** button that asks for confirmation
-before deleting. Scanning and cleaning run on background threads so the window
-never freezes.
+A single window, ordered by how risky each decision is:
 
-Beyond the cache categories, the window also has:
+1. **Storage summary** — the anchor: `4.7 GB safely reclaimable`, with
+   `29.5 GB free of 460.4 GB` and a neutral capacity meter that shows free space
+   in blue and what your selection would add in green.
+2. **Recommended cleanup** — the regenerable caches a scan found, already
+   selected. The list stays short; the rest fold into their group below.
+3. **Cache groups** — Developer / System / App caches, collapsed, each showing
+   its item count and total. App caches are never preselected (they re-download).
+4. **Advanced developer cleanup** — collapsed: Docker build cache, unused
+   images, stopped containers and networks, plus the `node_modules` finder and
+   unavailable iOS simulators. Per-image removal has its own list, with in-use
+   images locked.
+5. **Irreversible cleanup** — a separate collapsed danger zone for Docker
+   volumes, which hold real data. These are never included by Review & Clean or
+   by any select-all, and deleting them needs its own confirmation.
+6. **Recent activity** — collapsed until something happens, then it opens with
+   the result and the full output behind a details toggle.
 
-- **Docker panel** — per-image and per-volume lists with checkbox multi-select
-  delete (in-use images/volumes are locked), plus one-click build-cache prune.
-- **node_modules finder** — recursively finds `node_modules` folders under your
-  home directory (skipping Library, Trash, media folders), sorted by size, with
-  bulk delete.
-- **Extras** — iOS simulator cleanup and other space reported outside the cache
-  catalogue.
+Rows have a checkbox and a size, not a button each. One persistent action bar at
+the bottom reports `3 items selected · 4.7 GB` and offers **Review & Clean**,
+which opens a review dialog listing exactly what will go, what it should
+reclaim, and a final `Clean 4.7 GB`. With nothing selected it reads
+`Select items to clean` and stays disabled.
+
+Scanning and cleaning run on background threads, so the window never freezes and
+a background rescan never greys out the controls. The window follows your macOS
+light/dark appearance.
 
 ## Usage
 
@@ -162,6 +184,22 @@ password via the native macOS dialog); `--persist` also writes it to
 Edit the `TARGETS` array in [src/lib.rs](src/lib.rs) — each entry is a path
 relative to `$HOME`, a category, a description, and whether to clear the
 directory's contents or remove it entirely.
+
+## Layout
+
+```
+src/lib.rs        shared core: catalogue, scan/clean, Docker, selection rules
+src/main.rs       CLI (Rust std only, zero dependencies)
+src/bin/gui.rs    window: state, workers, sections, review/danger dialogs
+src/bin/ui/       presentation only — style.rs (design tokens), widgets.rs
+src/bin/tray.rs   menu-bar front-end
+assets/tray/      menu-bar template glyph (SVG master + 1x/2x/3x PNG masks)
+```
+
+The GUI and tray are feature-gated (`gui`, `tray`), so a default
+`cargo build` produces the CLI with no dependencies at all. Selection rules —
+what a bulk select may tick, when the primary action is live — live in the
+library so they are unit-tested without a window.
 
 ## License
 
