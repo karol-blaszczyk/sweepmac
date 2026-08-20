@@ -23,6 +23,22 @@ dependency-free.
 
 ## Install
 
+### Homebrew (recommended for teammates)
+
+The repo doubles as a Homebrew tap ([Formula/sweepmac.rb](Formula/sweepmac.rb)).
+It builds from source on your machine, so there are no Gatekeeper warnings and
+no signing required — you just need GitHub access to this repo and an ssh key:
+
+```bash
+brew tap karol-blaszczyk/sweepmac git@github.com:karol-blaszczyk/sweepmac.git
+brew install sweepmac        # installs sweepmac, sweepmac-gui, sweepmac-tray
+```
+
+Update later with `brew upgrade sweepmac` (or `brew install --HEAD sweepmac`
+to track `main`).
+
+### From a checkout
+
 ```bash
 # CLI only (tiny, no deps):
 cargo install --path .
