@@ -15,6 +15,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build all binaries
         run: cargo build --release --features "gui tray pkg"
+      - name: Tests
+        run: cargo test --features "gui tray pkg"
       - name: Check formatting
         run: cargo fmt --check
       - name: Clippy
