@@ -118,11 +118,11 @@ pub fn install(ctx: &egui::Context, t: &Tokens) {
     v.dark_mode = t.dark;
     v.panel_fill = t.canvas;
     v.window_fill = t.surface;
-    v.window_stroke = Stroke::new(1.0, t.divider);
+    v.window_stroke = Stroke::new(1.0_f32, t.divider);
     v.window_rounding = Rounding::same(12.0);
     v.override_text_color = Some(t.text);
     v.selection.bg_fill = t.accent.gamma_multiply(0.35);
-    v.selection.stroke = Stroke::new(1.0, t.accent);
+    v.selection.stroke = Stroke::new(1.0_f32, t.accent);
     v.hyperlink_color = t.accent;
 
     let rounding = Rounding::same(RADIUS_SMALL);
@@ -134,23 +134,23 @@ pub fn install(ctx: &egui::Context, t: &Tokens) {
         &mut v.widgets.open,
     ] {
         w.rounding = rounding;
-        w.fg_stroke = Stroke::new(1.0, t.text);
+        w.fg_stroke = Stroke::new(1.0_f32, t.text);
     }
     v.widgets.noninteractive.bg_fill = t.surface;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, t.divider);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, t.divider);
     v.widgets.inactive.bg_fill = t.raised;
     v.widgets.inactive.weak_bg_fill = t.raised;
     // Hovered/active double as the keyboard-focus appearance in egui, so give
     // them a visible accent edge rather than a subtle fill change.
     v.widgets.hovered.bg_fill = t.raised;
     v.widgets.hovered.weak_bg_fill = t.raised;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.5, t.accent);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.5_f32, t.accent);
     v.widgets.active.bg_fill = t.raised;
     v.widgets.active.weak_bg_fill = t.raised;
-    v.widgets.active.bg_stroke = Stroke::new(2.0, t.accent);
+    v.widgets.active.bg_stroke = Stroke::new(2.0_f32, t.accent);
     // Disabled controls stay legible: they explain themselves through nearby
     // copy, so they must not fade to unreadable grey.
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, t.text_secondary);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, t.text_secondary);
 
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     style.spacing.button_padding = egui::vec2(12.0, 6.0);
@@ -225,7 +225,7 @@ pub fn tinted_group<R>(
         .fill(t.surface)
         .rounding(Rounding::same(RADIUS))
         .inner_margin(Margin::symmetric(GROUP_PAD_X, GROUP_PAD_Y))
-        .stroke(Stroke::new(1.0, tint.gamma_multiply(0.45)))
+        .stroke(Stroke::new(1.0_f32, tint.gamma_multiply(0.45)))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui)
@@ -237,8 +237,11 @@ pub fn tinted_group<R>(
 pub fn divider(ui: &mut egui::Ui, t: &Tokens) {
     let h = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(egui::vec2(h, 1.0), egui::Sense::hover());
-    ui.painter()
-        .hline(rect.x_range(), rect.center().y, Stroke::new(1.0, t.divider));
+    ui.painter().hline(
+        rect.x_range(),
+        rect.center().y,
+        Stroke::new(1.0_f32, t.divider),
+    );
 }
 
 /// An uppercase section label.

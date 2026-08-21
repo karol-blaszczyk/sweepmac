@@ -410,7 +410,7 @@ impl App {
                     && self.selected.contains(&cache_key(r.id))
             })
             .collect();
-        v.sort_by(|a, b| b.size.cmp(&a.size));
+        v.sort_by_key(|r| std::cmp::Reverse(r.size));
         v
     }
 
@@ -1005,7 +1005,7 @@ impl App {
                 egui::Frame::default()
                     .fill(t.canvas)
                     .inner_margin(egui::Margin::symmetric(style::GUTTER, 12.0))
-                    .stroke(egui::Stroke::new(1.0, t.divider)),
+                    .stroke(egui::Stroke::new(1.0_f32, t.divider)),
             )
             .show(ctx, |ui| {
                 let summary = self.summary();
@@ -1753,7 +1753,7 @@ impl App {
                     .fill(t.surface)
                     .rounding(egui::Rounding::same(12.0))
                     .inner_margin(egui::Margin::same(18.0))
-                    .stroke(egui::Stroke::new(1.0, t.divider)),
+                    .stroke(egui::Stroke::new(1.0_f32, t.divider)),
             )
             .show(ctx, |ui| {
                 ui.set_max_width(390.0);
@@ -1866,7 +1866,7 @@ impl App {
                     .fill(t.surface)
                     .rounding(egui::Rounding::same(12.0))
                     .inner_margin(egui::Margin::same(18.0))
-                    .stroke(egui::Stroke::new(1.5, t.danger.gamma_multiply(0.7))),
+                    .stroke(egui::Stroke::new(1.5_f32, t.danger.gamma_multiply(0.7))),
             )
             .show(ctx, |ui| {
                 ui.set_max_width(390.0);
@@ -1953,7 +1953,7 @@ impl App {
                     .fill(t.surface)
                     .rounding(egui::Rounding::same(12.0))
                     .inner_margin(egui::Margin::same(18.0))
-                    .stroke(egui::Stroke::new(1.0, t.divider)),
+                    .stroke(egui::Stroke::new(1.0_f32, t.divider)),
             )
             .show(ctx, |ui| {
                 ui.set_max_width(390.0);

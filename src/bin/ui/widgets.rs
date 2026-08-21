@@ -302,7 +302,7 @@ pub fn risk_checkbox(
             p.rect_filled(rect, rounding, fill);
             // Bold checkmark in the on-fill colour.
             let c = rect.center();
-            let mark = Stroke::new(2.2, t.on_accent);
+            let mark = Stroke::new(2.2_f32, t.on_accent);
             p.line_segment(
                 [
                     egui::pos2(c.x - 4.5, c.y + 0.5),
@@ -319,13 +319,13 @@ pub fn risk_checkbox(
             );
         } else {
             let edge = if enabled { t.text_muted } else { t.divider };
-            p.rect_stroke(rect, rounding, Stroke::new(1.5, edge));
+            p.rect_stroke(rect, rounding, Stroke::new(1.5_f32, edge));
         }
         if response.hovered() || response.has_focus() {
             p.rect_stroke(
                 rect.expand(2.0),
                 Rounding::same(7.0),
-                Stroke::new(1.5, t.accent),
+                Stroke::new(1.5_f32, t.accent),
             );
         }
     }
@@ -566,7 +566,7 @@ pub fn item_manifest(ui: &mut egui::Ui, t: &Tokens, lines: &[(String, Option<u64
         .fill(if t.dark { t.canvas } else { t.raised })
         .rounding(Rounding::same(style::RADIUS_SMALL))
         .inner_margin(egui::Margin::symmetric(10.0, 8.0))
-        .stroke(Stroke::new(1.0, t.divider))
+        .stroke(Stroke::new(1.0_f32, t.divider))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             egui::ScrollArea::vertical()
