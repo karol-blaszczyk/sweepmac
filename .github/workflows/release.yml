@@ -5,6 +5,10 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# Needed to create the GitHub Release and attach the DMG.
+permissions:
+  contents: write
+
 jobs:
   installer:
     runs-on: macos-14
