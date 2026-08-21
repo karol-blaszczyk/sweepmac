@@ -125,17 +125,23 @@ fn main() {
 fn print_table(rows: &[sweepmac::ScanRow]) {
     println!("  {:<12} {:<34} {:>9}", "ID", "WHAT", "SIZE");
     println!("  {}", "─".repeat(58));
-    for row in rows {
-        let label = if row.size == 0 {
-            "—".to_string()
-        } else {
-            human(row.size)
-        };
+    // Empty caches (including apps that simply aren't installed) are hidden —
+    // a row of dashes says nothing actionable.
+    let hidden = rows.iter().filter(|r| r.size == 0).count();
+    for row in rows.iter().filter(|r| r.size > 0) {
         println!(
             "  {:<12} {:<34} {:>9}",
             row.id,
             truncate(row.desc, 34),
-            label
+            human(row.size)
+        );
+    }
+    if hidden > 0 {
+        println!(
+            "  {:<12} {:<34} {:>9}",
+            "",
+            format!("({hidden} more empty or not installed)"),
+            ""
         );
     }
 }

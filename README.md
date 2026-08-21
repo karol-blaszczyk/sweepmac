@@ -151,7 +151,7 @@ sweepmac --help
 | `macos`  | "Cleanup At Startup" temp staging |
 | `dev`    | Poetry, pip, Yarn, pnpm, npm, Playwright, Homebrew, Gradle, Maven, Cargo, Go build, JetBrains caches |
 | `xcode`  | DerivedData (build cache), iOS DeviceSupport symbols |
-| `app`    | Brave, Spotify, Ableton caches *(opt-in — these re-download)* |
+| `app`    | Chrome, Firefox, Edge, Arc, Brave, Slack, Discord, VS Code, Zoom, Notion, Figma, Telegram, Spotify, Ableton caches *(opt-in — these re-download; apps you don't have scan as empty and are hidden)* |
 
 `system`, `macos`, `dev`, and `xcode` are cleaned by default — note that
 includes **emptying the Trash**. `app` is opt-in via `--category app` or
