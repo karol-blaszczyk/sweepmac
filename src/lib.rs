@@ -258,7 +258,7 @@ pub fn scan(categories: &[&str]) -> io::Result<Vec<ScanRow>> {
             }
         })
         .collect();
-    rows.sort_by(|a, b| b.size.cmp(&a.size));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.size));
     Ok(rows)
 }
 
@@ -394,7 +394,7 @@ pub fn find_node_modules(root: &Path) -> Vec<NodeModules> {
     let home = home().ok();
     let mut out = Vec::new();
     walk_node_modules(root, &home, &mut out);
-    out.sort_by(|a, b| b.size.cmp(&a.size));
+    out.sort_by_key(|n| std::cmp::Reverse(n.size));
     out
 }
 
@@ -689,7 +689,7 @@ fn docker_images() -> Vec<DockerImage> {
             });
         }
     }
-    images.sort_by(|a, b| b.size.cmp(&a.size));
+    images.sort_by_key(|i| std::cmp::Reverse(i.size));
     images
 }
 
@@ -751,7 +751,7 @@ fn docker_volumes() -> Vec<DockerVolume> {
             }
         }
     }
-    vols.sort_by(|a, b| b.size.cmp(&a.size));
+    vols.sort_by_key(|v| std::cmp::Reverse(v.size));
     vols
 }
 
@@ -1081,10 +1081,14 @@ pub fn broom_rgba(size: u32, template: bool) -> Vec<u8> {
             }
             let total = (SS * SS) as u32;
             let idx = (y * n + x) * 4;
-            if cov > 0 {
-                buf[idx] = (cr / cov) as u8;
-                buf[idx + 1] = (cg / cov) as u8;
-                buf[idx + 2] = (cb / cov) as u8;
+            if let (Some(r), Some(g), Some(b)) = (
+                cr.checked_div(cov),
+                cg.checked_div(cov),
+                cb.checked_div(cov),
+            ) {
+                buf[idx] = r as u8;
+                buf[idx + 1] = g as u8;
+                buf[idx + 2] = b as u8;
                 buf[idx + 3] = (cov * 255 / total) as u8;
             }
         }
