@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.2.0 — 2026-08-26
+
+- Added 11 popular app caches: Chrome, Firefox, Edge, Arc, Slack, Discord,
+  VS Code, Zoom, Notion, Figma, Telegram (31 cache locations total).
+- CLI now hides empty and not-installed rows, collapsing them into a single
+  "(N more empty or not installed)" line.
+- Fixed row overlap and an unreadable checkbox state in the GUI.
+- Fixed clippy/rustc 1.98 lints across the binaries.
+- Release workflow now has `contents: write` so the DMG attaches to the release.
+
 ## v0.1.0 — 2026-08-20
 
 Initial release.
