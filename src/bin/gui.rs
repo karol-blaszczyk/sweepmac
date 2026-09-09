@@ -23,10 +23,11 @@ use std::time::Instant;
 use eframe::egui;
 use egui::RichText;
 use sweepmac::{
-    action_enabled, bulk_selectable_keys, clean_target, dir_size, disk_free, docker_info,
-    find_node_modules, home, human, persist_pty_limit, pty_status, raise_pty_limit, scan,
-    summarize, target_by_id, DockerImage, DockerInfo, DockerVolume, NodeModules, PtyLevel,
-    PtyStatus, Risk, Selectable, SelectionSummary, ALL_CATEGORIES, DEFAULT_CLEAN_CATEGORIES,
+    action_enabled, bulk_selectable_keys, clean_build_dir, clean_target, dir_size, disk_free,
+    docker_info, find_git_repos, find_node_modules, home, human, persist_pty_limit, pty_status,
+    raise_pty_limit, remove_worktree, scan, summarize, target_by_id, DockerImage, DockerInfo,
+    DockerVolume, GitRepo, NodeModules, PtyLevel, PtyStatus, Risk, Selectable, SelectionSummary,
+    Worktree, WorktreeKind, ALL_CATEGORIES, DEFAULT_CLEAN_CATEGORIES,
 };
 
 use ui::style::{self, Tokens};
@@ -107,6 +108,12 @@ enum Job {
         path: PathBuf,
         size: u64,
     },
+    /// A regenerable build directory inside a git worktree.
+    BuildDir {
+        label: String,
+        path: PathBuf,
+        size: u64,
+    },
     Simulators,
 }
 
@@ -115,14 +122,16 @@ impl Job {
         match self {
             Job::Cache { desc, .. } => desc.clone(),
             Job::DockerPrune { label, .. } => label.clone(),
-            Job::NodeModules { label, .. } => label.clone(),
+            Job::NodeModules { label, .. } | Job::BuildDir { label, .. } => label.clone(),
             Job::Simulators => "Unavailable iOS simulators".to_string(),
         }
     }
 
     fn size(&self) -> u64 {
         match self {
-            Job::Cache { size, .. } | Job::NodeModules { size, .. } => *size,
+            Job::Cache { size, .. }
+            | Job::NodeModules { size, .. }
+            | Job::BuildDir { size, .. } => *size,
             // Docker/simctl report their own reclaim; we don't pre-credit it.
             Job::DockerPrune { .. } | Job::Simulators => 0,
         }
@@ -148,6 +157,13 @@ enum Danger {
     DockerVolumes { names: Vec<String>, total: u64 },
 }
 
+/// Removing one git worktree. Individual opt-in by design: this is never part
+/// of a bulk selection, so it gets its own action and its own confirmation.
+#[derive(Clone)]
+struct RemoveWorktree {
+    wt: Worktree,
+}
+
 /// A non-destructive Docker action kept next to its own list.
 #[derive(Clone)]
 enum DockerAction {
@@ -167,6 +183,7 @@ enum Msg {
     },
     DockerScanned(Option<DockerInfo>),
     NmScanned(Vec<NodeModules>),
+    GitScanned(Vec<GitRepo>),
     Log(String),
     /// A batch finished: what it freed and whether every job succeeded.
     Done {
@@ -201,6 +218,12 @@ struct App {
     docker_scanning: bool,
     node_modules: Vec<NodeModules>,
     nm_scanning: bool,
+    /// Repositories found by the opt-in git scan. Empty until it is asked for —
+    /// walking repos is a departure from the default promise.
+    git_repos: Vec<GitRepo>,
+    git_scanning: bool,
+    /// True once the user has asked for a repository scan in this session.
+    git_requested: bool,
 
     /// The shared selection for safe/conditional items, keyed by `Selectable`.
     selected: HashSet<String>,
@@ -215,6 +238,7 @@ struct App {
     /// Gate on the danger dialog — the user must acknowledge explicitly.
     danger_ack: bool,
     docker_action: Option<DockerAction>,
+    remove_wt: Option<RemoveWorktree>,
 
     activity: Vec<Activity>,
     activity_open: bool,
@@ -230,6 +254,7 @@ struct App {
     work_rx: Option<Receiver<Msg>>,
     nm_rx: Option<Receiver<Msg>>,
     docker_rx: Option<Receiver<Msg>>,
+    git_rx: Option<Receiver<Msg>>,
 }
 
 impl App {
@@ -249,6 +274,9 @@ impl App {
             docker_scanning: false,
             node_modules: Vec::new(),
             nm_scanning: false,
+            git_repos: Vec::new(),
+            git_scanning: false,
+            git_requested: false,
             selected: HashSet::new(),
             vol_selected: HashSet::new(),
             img_selected: HashSet::new(),
@@ -256,6 +284,7 @@ impl App {
             danger: None,
             danger_ack: false,
             docker_action: None,
+            remove_wt: None,
             activity: Vec::new(),
             activity_open: false,
             log: Vec::new(),
@@ -266,6 +295,7 @@ impl App {
             work_rx: None,
             nm_rx: None,
             docker_rx: None,
+            git_rx: None,
         };
         app.start_scan();
         app.start_nm_scan();
@@ -333,6 +363,27 @@ impl App {
         });
     }
 
+    /// Walk repositories under $HOME. Opt-in: only ever started by an explicit
+    /// click, never as part of the automatic first scan.
+    fn start_git_scan(&mut self) {
+        self.git_requested = true;
+        self.git_scanning = true;
+        let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
+        self.git_rx = Some(rx);
+        let ctx = self.ctx.clone();
+        thread::spawn(move || {
+            let found = home().map(|h| find_git_repos(&h)).unwrap_or_default();
+            let _ = tx.send(Msg::GitScanned(found));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Every worktree found, flattened — the sections and the review both want
+    /// the list without the per-repo nesting.
+    fn worktrees(&self) -> impl Iterator<Item = &Worktree> {
+        self.git_repos.iter().flat_map(|r| r.worktrees.iter())
+    }
+
     // --- selection ------------------------------------------------------
 
     /// Every item that participates in the shared selection, in one list, so
@@ -352,6 +403,17 @@ impl App {
                 nm_key(&nm.path),
                 nm.size,
                 Risk::Conditional,
+            ));
+        }
+        // Build dirs are regenerable wherever they sit — including inside an
+        // UNSAFE worktree, where they are usually the bulk of the space. The
+        // worktrees themselves are deliberately absent: removing one is an
+        // individual decision with its own button, never a bulk tick.
+        for b in self.worktrees().flat_map(|w| w.build.iter()) {
+            items.push(Selectable::new(
+                gitbuild_key(&b.path),
+                b.size,
+                Risk::Regenerable,
             ));
         }
         if self.sims > 0 {
@@ -493,6 +555,25 @@ impl App {
             }
         }
 
+        // Git build dirs.
+        let builds: Vec<&sweepmac::BuildDir> = self
+            .worktrees()
+            .flat_map(|w| w.build.iter())
+            .filter(|b| self.selected.contains(&gitbuild_key(&b.path)))
+            .collect();
+        if !builds.is_empty() {
+            let bytes: u64 = builds.iter().map(|b| b.size).sum();
+            groups.push(("Git build dirs".to_string(), builds.len(), bytes));
+            for b in builds {
+                keys.push(gitbuild_key(&b.path));
+                jobs.push(Job::BuildDir {
+                    label: b.label.clone(),
+                    path: b.path.clone(),
+                    size: b.size,
+                });
+            }
+        }
+
         if self.selected.contains("sims") && self.sims > 0 {
             // 0 bytes: only simctl knows how much of the tree is unavailable.
             groups.push(("iOS simulators".to_string(), 1, 0));
@@ -570,6 +651,21 @@ impl App {
                                 let _ = tx
                                     .send(Msg::Log(format!("  removed {label} ({})", human(size))));
                                 let _ = tx.send(Msg::NmRemoved { path });
+                            }
+                            Err(e) => {
+                                failures += 1;
+                                let _ = tx.send(Msg::Log(format!("  FAILED {label}: {e}")));
+                            }
+                        }
+                    }
+                    Job::BuildDir { label, path, size } => {
+                        let _ = tx.send(Msg::Log(format!("rm -rf {}", path.display())));
+                        ctx.request_repaint();
+                        match clean_build_dir(&path) {
+                            Ok(()) => {
+                                freed += size;
+                                let _ = tx
+                                    .send(Msg::Log(format!("  removed {label} ({})", human(size))));
                             }
                             Err(e) => {
                                 failures += 1;
@@ -693,6 +789,41 @@ impl App {
                 });
             }
         }
+    }
+
+    /// Remove one SAFE worktree after its own confirmation. The library
+    /// archives the tip as a tag before anything is deleted.
+    fn run_remove_worktree(&mut self, r: RemoveWorktree) {
+        self.phase = Phase::Working;
+        self.log.clear();
+        self.started = Some(Instant::now());
+        self.status = format!("Removing {}…", r.wt.label);
+        let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
+        self.work_rx = Some(rx);
+        let ctx = self.ctx.clone();
+        thread::spawn(move || {
+            let total = r.wt.total;
+            let label = r.wt.label.clone();
+            let (ok, summary) = match remove_worktree(&r.wt) {
+                Ok(log) => {
+                    for line in log.lines() {
+                        let _ = tx.send(Msg::Log(line.to_string()));
+                    }
+                    (true, format!("Removed {label} · {}", human(total)))
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::Log(e.clone()));
+                    (false, format!("Could not remove {label}: {e}"))
+                }
+            };
+            let _ = tx.send(Msg::Done {
+                freed: if ok { total } else { 0 },
+                ok,
+                summary,
+                rescan: true,
+            });
+            ctx.request_repaint();
+        });
     }
 
     fn run_pty(&mut self, persist: bool) {
@@ -838,6 +969,10 @@ impl App {
                         // Refresh totals and the selection from reality.
                         self.start_scan();
                         self.start_docker_scan();
+                        // Only re-walk repositories if the user opted in once.
+                        if self.git_requested {
+                            self.start_git_scan();
+                        }
                     } else {
                         self.pty = pty_status();
                     }
@@ -846,7 +981,7 @@ impl App {
                     self.node_modules.retain(|n| n.path != path);
                     self.selected.remove(&nm_key(&path));
                 }
-                Msg::DockerScanned(_) | Msg::NmScanned(_) => {}
+                Msg::DockerScanned(_) | Msg::NmScanned(_) | Msg::GitScanned(_) => {}
             }
         }
 
@@ -861,6 +996,29 @@ impl App {
                 self.node_modules = found;
                 self.nm_scanning = false;
                 self.nm_rx = None;
+            }
+        }
+
+        let mut git_batch: Vec<Msg> = Vec::new();
+        if let Some(rx) = &self.git_rx {
+            while let Ok(msg) = rx.try_recv() {
+                git_batch.push(msg);
+            }
+        }
+        for msg in git_batch {
+            if let Msg::GitScanned(found) = msg {
+                // Drop selections for build dirs that no longer exist.
+                let live: HashSet<String> = found
+                    .iter()
+                    .flat_map(|r| r.worktrees.iter())
+                    .flat_map(|w| w.build.iter())
+                    .map(|b| gitbuild_key(&b.path))
+                    .collect();
+                self.selected
+                    .retain(|k| !k.starts_with("gitbuild:") || live.contains(k));
+                self.git_repos = found;
+                self.git_scanning = false;
+                self.git_rx = None;
             }
         }
 
@@ -894,6 +1052,9 @@ struct Effects {
     /// `Some(persist)` when a pty action was clicked.
     pty_action: Option<bool>,
     rescan_nm: bool,
+    rescan_git: bool,
+    /// A single worktree the user asked to remove.
+    remove_wt: Option<Worktree>,
 }
 
 /// Display groups for cache categories, in first-screen order.
@@ -911,6 +1072,9 @@ fn docker_key(kind: &str) -> String {
 }
 fn nm_key(p: &std::path::Path) -> String {
     format!("nm:{}", p.display())
+}
+fn gitbuild_key(p: &std::path::Path) -> String {
+    format!("gitbuild:{}", p.display())
 }
 fn vol_key(name: &str) -> String {
     format!("vol:{name}")
@@ -960,6 +1124,7 @@ impl eframe::App for App {
         self.review_dialog(ctx);
         self.danger_dialog(ctx);
         self.docker_action_dialog(ctx);
+        self.remove_worktree_dialog(ctx);
     }
 }
 
@@ -1059,6 +1224,8 @@ impl App {
                         ui.add_space(style::SECTION_GAP);
                         self.advanced_section(ui, can_act, &mut fx);
                         ui.add_space(style::SECTION_GAP);
+                        self.git_section(ui, can_act, &mut fx);
+                        ui.add_space(style::SECTION_GAP);
                         self.danger_section(ui, can_act, &mut fx);
                         ui.add_space(style::SECTION_GAP);
                         w::activity_section(
@@ -1140,6 +1307,12 @@ impl App {
                 }
                 if fx.rescan_nm {
                     self.start_nm_scan();
+                }
+                if fx.rescan_git {
+                    self.start_git_scan();
+                }
+                if let Some(wt) = std::mem::take(&mut fx.remove_wt) {
+                    self.remove_wt = Some(RemoveWorktree { wt });
                 }
                 if let Some(persist) = fx.pty_action {
                     self.run_pty(persist);
@@ -1583,6 +1756,284 @@ impl App {
         );
     }
 
+    /// Git worktrees and their build caches. Opt-in: nothing is walked until
+    /// the user asks, because scanning repositories at all is a departure from
+    /// what the rest of the app promises.
+    ///
+    /// Three tiers, matching the risk model: build dirs are ordinary
+    /// regenerable ticks (even inside a worktree that must be kept), a SAFE
+    /// worktree gets its own individual Remove button, and an UNSAFE one is
+    /// shown locked with the reason — the Docker-volume quarantine pattern.
+    fn git_section(&self, ui: &mut egui::Ui, can_act: bool, fx: &mut Effects) {
+        let t = self.tokens;
+        let build_bytes: u64 = self.git_repos.iter().map(|r| r.build_bytes()).sum();
+        let count: usize = self
+            .git_repos
+            .iter()
+            .map(|r| r.worktrees.iter().map(|w| w.build.len() + 1).sum::<usize>())
+            .sum();
+
+        w::collapsing_group(
+            ui,
+            &t,
+            w::GroupSpec {
+                id: "git",
+                title: "Git worktrees & build caches",
+                count,
+                bytes: build_bytes,
+                default_open: self.git_requested,
+                tint: Some(t.caution),
+            },
+            |ui| {
+                if !self.git_requested {
+                    ui.label(style::meta(
+                        &t,
+                        "sweepmac does not look inside your repositories unless you ask. A scan \
+                         here is read-only: it runs git plumbing only, never `git status`, so it \
+                         cannot leave a lock behind or change a single file.",
+                    ));
+                    ui.add_space(8.0);
+                    if ui
+                        .add_enabled(can_act, style::primary_button(&t, "Scan repositories"))
+                        .clicked()
+                    {
+                        fx.rescan_git = true;
+                    }
+                    return;
+                }
+
+                ui.horizontal(|ui| {
+                    ui.label(style::meta(
+                        &t,
+                        "Stale worktrees each carry a full build directory — usually far more \
+                         than their source.",
+                    ));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.git_scanning {
+                            ui.add(egui::Spinner::new().size(12.0).color(t.text_muted));
+                        } else if ui.add(style::quiet_button(&t, "Rescan")).clicked() {
+                            fx.rescan_git = true;
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+
+                if self.git_repos.is_empty() {
+                    ui.label(style::meta(
+                        &t,
+                        if self.git_scanning {
+                            "walking your repositories…"
+                        } else {
+                            "no git repositories found"
+                        },
+                    ));
+                    return;
+                }
+
+                for repo in &self.git_repos {
+                    style::section_label(ui, &t, &repo.label.to_uppercase());
+                    ui.add_space(4.0);
+                    for wt in &repo.worktrees {
+                        self.git_worktree_rows(ui, wt, can_act, fx);
+                        ui.add_space(8.0);
+                    }
+                    ui.add_space(4.0);
+                }
+                ui.label(style::meta(
+                    &t,
+                    "Removing a worktree tags its tip as archive/<branch> first, so no commit is \
+                     ever made unreachable. It is never included in a select-all.",
+                ));
+            },
+        );
+    }
+
+    /// One worktree: its status line, its build dirs, and its own action.
+    fn git_worktree_rows(&self, ui: &mut egui::Ui, wt: &Worktree, can_act: bool, fx: &mut Effects) {
+        let t = self.tokens;
+        let safe = wt.safety.is_safe();
+        let primary = wt.kind == WorktreeKind::Primary;
+        let tint = if safe { t.caution } else { t.text_muted };
+
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(if primary {
+                    "repository".to_string()
+                } else {
+                    wt.branch.clone().unwrap_or_else(|| "detached".to_string())
+                })
+                .size(style::T_BODY)
+                .strong()
+                .color(t.text),
+            );
+            w::status_pill(
+                ui,
+                &t,
+                if primary {
+                    "checkout"
+                } else if safe {
+                    "safe to remove"
+                } else {
+                    "keep"
+                },
+                tint,
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(style::meta(
+                    &t,
+                    format!(
+                        "{} build · {} source",
+                        human(wt.build_bytes),
+                        human(wt.source_bytes)
+                    ),
+                ));
+            });
+        });
+        ui.label(style::meta(&t, &wt.label));
+
+        // The reason a worktree must be kept is the whole point of showing it.
+        if let Some(reason) = wt.safety.reason() {
+            ui.label(
+                RichText::new(reason)
+                    .size(style::T_META)
+                    .color(t.text_secondary),
+            );
+        }
+
+        // Build dirs stay reclaimable whatever the worktree's verdict is.
+        for b in &wt.build {
+            ui.add_space(style::ROW_GAP);
+            let key = gitbuild_key(&b.path);
+            let toggled = w::select_row(
+                ui,
+                &t,
+                RowView {
+                    name: b
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy())
+                        .unwrap_or_default()
+                        .as_ref(),
+                    note: Some("Rebuilt by the project's own tooling"),
+                    size: b.size,
+                    checked: self.selected.contains(&key),
+                    enabled: true,
+                    locked: false,
+                    lock_note: None,
+                    details: Some(&b.path.to_string_lossy()),
+                    tint: t.accent,
+                },
+            );
+            if toggled {
+                fx.toggles.push(key);
+            }
+        }
+
+        // Removing the worktree itself: individual opt-in, never a checkbox.
+        if wt.removable() {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(style::meta(
+                    &t,
+                    format!("Whole worktree · {}", human(wt.total)),
+                ));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(can_act, style::quiet_button(&t, "Remove worktree…"))
+                        .clicked()
+                    {
+                        fx.remove_wt = Some(wt.clone());
+                    }
+                });
+            });
+        }
+    }
+
+    /// Confirmation for removing one worktree. Not the danger path: the tip is
+    /// archived as a tag first, so this reclaims space without losing commits.
+    fn remove_worktree_dialog(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.remove_wt.clone() else {
+            return;
+        };
+        let t = self.tokens;
+        w::backdrop(ctx);
+        let mut confirm = false;
+        let mut cancel = false;
+        let wt = &action.wt;
+        egui::Window::new("Remove worktree")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(
+                egui::Frame::default()
+                    .fill(t.surface)
+                    .rounding(egui::Rounding::same(12.0))
+                    .inner_margin(egui::Margin::same(18.0))
+                    .stroke(egui::Stroke::new(1.0_f32, t.divider)),
+            )
+            .show(ctx, |ui| {
+                ui.set_max_width(390.0);
+                ui.label(
+                    RichText::new(format!("Reclaim {}", human(wt.total)))
+                        .size(20.0)
+                        .strong()
+                        .color(t.safe),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!(
+                        "{} is clean, and its content is already on the default branch — the \
+                         same tree is on a commit there, even though the branch has its own SHAs.",
+                        wt.branch.as_deref().unwrap_or("This worktree")
+                    ))
+                    .size(style::T_META)
+                    .color(t.text_secondary),
+                );
+                ui.add_space(10.0);
+                w::item_manifest(
+                    ui,
+                    &t,
+                    &[
+                        (wt.label.clone(), Some(wt.total)),
+                        (format!("build output · {}", human(wt.build_bytes)), None),
+                        (format!("source · {}", human(wt.source_bytes)), None),
+                    ],
+                );
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new(format!(
+                        "sweepmac tags the tip as {} first, so every commit stays reachable, then \
+                         removes the directory, prunes the admin entry and deletes the branch. \
+                         Nothing in your repository's history is lost.",
+                        wt.archive_tag()
+                    ))
+                    .size(style::T_META)
+                    .color(t.text_secondary),
+                );
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    if ui.add(style::quiet_button(&t, "Cancel")).clicked() {
+                        cancel = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(style::primary_button(&t, "Remove worktree"))
+                            .clicked()
+                        {
+                            confirm = true;
+                        }
+                    });
+                });
+            });
+
+        if confirm {
+            self.remove_wt = None;
+            self.run_remove_worktree(action);
+        } else if cancel {
+            self.remove_wt = None;
+        }
+    }
+
     /// 6. Irreversible cleanup — data-bearing, never bulk-selected.
     fn danger_section(&self, ui: &mut egui::Ui, can_act: bool, fx: &mut Effects) {
         let t = self.tokens;
@@ -1800,7 +2251,15 @@ impl App {
                     .jobs
                     .iter()
                     .any(|j| matches!(j, Job::NodeModules { .. }));
-                let note = if has_nm {
+                let has_build = review
+                    .jobs
+                    .iter()
+                    .any(|j| matches!(j, Job::BuildDir { .. }));
+                let note = if has_build {
+                    "Build directories are deleted from inside your repositories — your tools \
+                     rebuild them on the next build. No source, no commits and no worktrees are \
+                     touched by this batch."
+                } else if has_nm {
                     "Caches are regenerable: your tools rebuild them when next needed. The \
                      selected node_modules folders are deleted permanently from inside your \
                      project directories — rebuild each project with npm / yarn / pnpm install."

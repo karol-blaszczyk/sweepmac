@@ -19,7 +19,7 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-use sweepmac::{disk_free, human, scan, DEFAULT_CLEAN_CATEGORIES};
+use sweepmac::{disk_free, find_git_repos, home, human, scan, DEFAULT_CLEAN_CATEGORIES};
 
 /// Nominal template size in points; macOS wants the @2x pixel buffer.
 const TEMPLATE_PT: u32 = 18;
@@ -33,9 +33,20 @@ struct ScanReport {
     disk_total: u64,
 }
 
+/// What the opt-in repository walk found. Kept out of `ScanReport` — and out
+/// of the headline total — because scanning repos is a separate, explicit ask.
+struct GitReport {
+    /// Regenerable build dirs across every worktree.
+    build: u64,
+    /// Worktrees sweepmac verified as safe to remove, and what they hold.
+    safe_worktrees: usize,
+    safe_bytes: u64,
+}
+
 enum UserEvent {
     Menu(MenuEvent),
     Scanned(ScanReport),
+    GitScanned(GitReport),
 }
 
 /// Long-lived menu handles updated after each scan.
@@ -45,7 +56,9 @@ struct Tray {
     disk: MenuItem,
     review: MenuItem,
     scan: MenuItem,
+    git: MenuItem,
     scanning: bool,
+    git_scanning: bool,
 }
 
 fn main() {
@@ -77,6 +90,12 @@ fn main() {
                 }
             }
 
+            Event::UserEvent(UserEvent::GitScanned(r)) => {
+                if let Some(t) = tray.as_mut() {
+                    t.apply_git(&r);
+                }
+            }
+
             Event::UserEvent(UserEvent::Menu(e)) => {
                 let scanning = tray.as_ref().map(|t| t.scanning).unwrap_or(false);
                 match e.id.0.as_str() {
@@ -85,6 +104,14 @@ fn main() {
                             t.mark_scanning();
                         }
                         spawn_scan(&proxy);
+                    }
+                    // Repositories are only walked when asked: the menu never
+                    // does it as part of the ordinary scan.
+                    "git" if !scanning => {
+                        if let Some(t) = tray.as_mut() {
+                            t.mark_git_scanning();
+                        }
+                        spawn_git_scan(&proxy);
                     }
                     // Both routes open the window; cleaning is always confirmed
                     // there, never silently from the menu bar.
@@ -107,9 +134,36 @@ impl Tray {
         self.scan.set_enabled(false);
     }
 
+    fn mark_git_scanning(&mut self) {
+        self.git_scanning = true;
+        self.git.set_text("Scanning repositories…");
+        self.git.set_enabled(false);
+    }
+
+    fn apply_git(&mut self, r: &GitReport) {
+        self.git_scanning = false;
+        self.git.set_enabled(true);
+        if r.build == 0 && r.safe_worktrees == 0 {
+            self.git.set_text("Git worktrees: nothing to reclaim");
+            return;
+        }
+        // Two numbers, because they carry different weight: build dirs are
+        // ordinary regenerable cleanup, a worktree removal is a decision.
+        let mut text = format!("Git build dirs: {}", human(r.build));
+        if r.safe_worktrees > 0 {
+            text.push_str(&format!(
+                " · {} worktree{} safe to remove ({})",
+                r.safe_worktrees,
+                if r.safe_worktrees == 1 { "" } else { "s" },
+                human(r.safe_bytes)
+            ));
+        }
+        self.git.set_text(text);
+    }
+
     fn apply_report(&mut self, r: &ScanReport) {
         self.scanning = false;
-        self.scan.set_enabled(true);
+        self.scan.set_enabled(!self.git_scanning);
         self.status
             .set_text(format!("{} safely reclaimable", human(r.safe)));
         if r.disk_total > 0 {
@@ -133,6 +187,8 @@ fn build_tray() -> Tray {
     let disk = MenuItem::with_id("disk", "Reading disk…", false, None);
     let scan = MenuItem::with_id("scan", "Scan now", true, None);
     let review = MenuItem::with_id("review", "Review recommended cleanup…", false, None);
+    // Opt-in: repositories are never walked by the automatic scan.
+    let git = MenuItem::with_id("git", "Scan git worktrees…", true, None);
     let open = MenuItem::with_id("open", "Open sweepmac", true, None);
     let quit = MenuItem::with_id("quit", "Quit sweepmac", true, None);
 
@@ -143,6 +199,7 @@ fn build_tray() -> Tray {
         &PredefinedMenuItem::separator(),
         &scan,
         &review,
+        &git,
         &open,
         &PredefinedMenuItem::separator(),
         &quit,
@@ -173,8 +230,30 @@ fn build_tray() -> Tray {
         disk,
         review,
         scan,
+        git,
         scanning: false,
+        git_scanning: false,
     }
+}
+
+/// Walk repositories in the background. Read-only, like every scan here.
+fn spawn_git_scan(proxy: &EventLoopProxy<UserEvent>) {
+    let proxy = proxy.clone();
+    thread::spawn(move || {
+        let repos = home().map(|h| find_git_repos(&h)).unwrap_or_default();
+        let build: u64 = repos.iter().map(|r| r.build_bytes()).sum();
+        let safe: Vec<u64> = repos
+            .iter()
+            .flat_map(|r| r.worktrees.iter())
+            .filter(|w| w.removable())
+            .map(|w| w.total)
+            .collect();
+        let _ = proxy.send_event(UserEvent::GitScanned(GitReport {
+            build,
+            safe_worktrees: safe.len(),
+            safe_bytes: safe.iter().sum(),
+        }));
+    });
 }
 
 /// Scan in the background and report a snapshot back to the menu. Scanning only

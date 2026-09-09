@@ -300,7 +300,12 @@ pub const TARGETS: &[Target] = &[
 pub const DEFAULT_CLEAN_CATEGORIES: &[&str] = &["system", "macos", "dev", "xcode"];
 
 /// Every category, in display order.
-pub const ALL_CATEGORIES: &[&str] = &["system", "macos", "dev", "xcode", "app"];
+///
+/// `git` has no `TARGETS` entries — it is a discovery category, handled by
+/// [`find_git_repos`]. It is deliberately absent from
+/// `DEFAULT_CLEAN_CATEGORIES`: scanning repositories at all is a departure from
+/// the "git repos are never scanned" default, so it must be asked for.
+pub const ALL_CATEGORIES: &[&str] = &["system", "macos", "dev", "xcode", "app", "git"];
 
 /// A measured target ready to show or clean.
 pub struct ScanRow {
@@ -491,11 +496,7 @@ fn walk_node_modules(dir: &Path, home: &Option<PathBuf>, out: &mut Vec<NodeModul
         if name == "node_modules" {
             let path = entry.path();
             let size = dir_size(&path);
-            let label = home
-                .as_ref()
-                .and_then(|h| path.strip_prefix(h).ok())
-                .map(|p| format!("~/{}", p.display()))
-                .unwrap_or_else(|| path.display().to_string());
+            let label = short_label(&path, home);
             out.push(NodeModules { path, label, size });
             continue; // prune: don't descend into deps
         }
@@ -509,6 +510,720 @@ fn walk_node_modules(dir: &Path, home: &Option<PathBuf>, out: &mut Vec<NodeModul
         }
         walk_node_modules(&entry.path(), home, out);
     }
+}
+
+/// Display path, shortened to `~/…` when under the home directory.
+fn short_label(path: &Path, home: &Option<PathBuf>) -> String {
+    home.as_ref()
+        .and_then(|h| path.strip_prefix(h).ok())
+        .map(|p| format!("~/{}", p.display()))
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+// --- Git worktrees + regenerable build directories ------------------------
+//
+// Stale worktrees pile up: agents park them under `<repo>/.claude/worktrees/`
+// and `~/.claude-worktrees/`, and each one carries a full build directory. One
+// sweepmac worktree held 2.3 GB of Rust `target/` behind 200 KB of source.
+//
+// Discovery here is strictly READ-ONLY. Every git call is plumbing run with
+// `GIT_OPTIONAL_LOCKS=0`, and `git status` is never used: run against a foreign
+// work-tree it leaves a stale `.git/index.lock` behind, which breaks the repo
+// for its actual owner. Nothing is written until `remove_worktree` is called.
+
+/// Directory names that hold build output — regenerable by the project's own
+/// tooling, and usually the bulk of a worktree's size.
+pub const BUILD_DIRS: &[&str] = &[
+    "target",
+    "node_modules",
+    ".next",
+    "build",
+    "dist",
+    "__pycache__",
+    ".venv",
+];
+
+/// Directories we never descend into while hunting for git repositories.
+const GIT_SKIP: &[&str] = &[
+    "Library",
+    ".Trash",
+    "Pictures",
+    "Movies",
+    "Music",
+    "Applications",
+    "node_modules",
+];
+
+/// Dotdirs we *do* descend into: agent tooling parks worktrees in them, and
+/// they would otherwise be invisible to the walk.
+const GIT_DOT_ALLOW: &[&str] = &[".claude", ".claude-worktrees"];
+
+/// How far back along the default branch to look for a matching tree. A rebased
+/// branch's content usually lands within a few hundred commits; the cap keeps a
+/// single `git log` bounded on very large repositories.
+const TREE_SCAN_DEPTH: usize = 2000;
+
+/// Resolve the `git` binary once: prefer PATH, then the usual install dirs
+/// (GUI apps launched from Finder don't inherit a shell PATH — see `docker_bin`).
+pub fn git_bin() -> &'static str {
+    static PATH: OnceLock<String> = OnceLock::new();
+    PATH.get_or_init(|| {
+        if Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            return "git".to_string();
+        }
+        for dir in EXTRA_BIN_DIRS.iter().chain(["/usr/bin"].iter()) {
+            let candidate = format!("{dir}/git");
+            if Path::new(&candidate).is_file() {
+                return candidate;
+            }
+        }
+        "git".to_string() // give up gracefully; callers handle the failure
+    })
+    .as_str()
+}
+
+/// Whether git can be run at all. Everything git-related degrades to "nothing
+/// found" when this is false.
+pub fn git_available() -> bool {
+    static OK: OnceLock<bool> = OnceLock::new();
+    *OK.get_or_init(|| {
+        git_cmd()
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    })
+}
+
+/// A git invocation that is forbidden from taking the index lock. Read-only
+/// plumbing still opportunistically rewrites a refreshed index without this.
+fn git_cmd() -> Command {
+    let mut c = Command::new(git_bin());
+    c.env("GIT_OPTIONAL_LOCKS", "0");
+    c
+}
+
+/// Run git in `dir` and return trimmed stdout. `None` when it fails or exits
+/// non-zero (which is also how the `--verify` style probes report "no").
+fn git(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = git_cmd().arg("-C").arg(dir).args(args).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+}
+
+/// Whether a git predicate (`merge-base --is-ancestor`, …) exits 0.
+fn git_ok(dir: &Path, args: &[&str]) -> bool {
+    git_cmd()
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// A regenerable build directory found inside a worktree.
+#[derive(Clone, Debug)]
+pub struct BuildDir {
+    pub path: PathBuf,
+    /// Display path, shortened to `~/…` when under the home directory.
+    pub label: String,
+    pub size: u64,
+}
+
+/// Whether a worktree is the repository's own checkout or a linked one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WorktreeKind {
+    /// The repository's main working directory. Its source is never touched —
+    /// only its build directories are offered.
+    Primary,
+    /// A `git worktree add` checkout.
+    Linked,
+}
+
+/// Whether a worktree may be removed, and if not, why not.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum WorktreeSafety {
+    /// Clean, and its content is already present on the default branch.
+    Safe,
+    /// Surfaced read-only with the reason. Never selectable.
+    Unsafe(String),
+}
+
+impl WorktreeSafety {
+    pub fn is_safe(&self) -> bool {
+        matches!(self, WorktreeSafety::Safe)
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            WorktreeSafety::Safe => None,
+            WorktreeSafety::Unsafe(r) => Some(r),
+        }
+    }
+}
+
+/// One worktree of a repository, measured and classified.
+#[derive(Clone, Debug)]
+pub struct Worktree {
+    pub path: PathBuf,
+    /// Display path, shortened to `~/…` when under the home directory.
+    pub label: String,
+    /// The repository's primary worktree — where removal commands are run.
+    pub repo: PathBuf,
+    /// The `<common>/worktrees/<name>` admin entry, when one exists.
+    pub admin: Option<String>,
+    /// Short branch name, or `None` for a detached HEAD.
+    pub branch: Option<String>,
+    pub head: String,
+    pub kind: WorktreeKind,
+    /// Whole-tree size on disk.
+    pub total: u64,
+    pub build: Vec<BuildDir>,
+    /// Bytes held by regenerable build directories.
+    pub build_bytes: u64,
+    /// Everything that is not a build directory — the actual source.
+    pub source_bytes: u64,
+    pub safety: WorktreeSafety,
+}
+
+impl Worktree {
+    /// The tag that keeps this worktree's commits reachable after removal.
+    pub fn archive_tag(&self) -> String {
+        match &self.branch {
+            Some(b) => format!("archive/{b}"),
+            None => format!("archive/detached-{}", short_sha(&self.head)),
+        }
+    }
+
+    /// True when removing the whole worktree is offered (individually — this is
+    /// never bulk-selectable).
+    pub fn removable(&self) -> bool {
+        self.kind == WorktreeKind::Linked && self.safety.is_safe()
+    }
+}
+
+/// A repository and every worktree attached to it.
+#[derive(Clone, Debug)]
+pub struct GitRepo {
+    /// The primary worktree's path.
+    pub path: PathBuf,
+    pub label: String,
+    /// The ref the default branch resolves to, e.g. `refs/remotes/origin/main`.
+    pub default_branch: Option<String>,
+    /// Primary worktree first, then linked ones largest first.
+    pub worktrees: Vec<Worktree>,
+}
+
+impl GitRepo {
+    /// Bytes held by regenerable build directories across every worktree.
+    pub fn build_bytes(&self) -> u64 {
+        self.worktrees.iter().map(|w| w.build_bytes).sum()
+    }
+
+    /// Bytes that removing every SAFE linked worktree would free.
+    pub fn safe_worktree_bytes(&self) -> u64 {
+        self.worktrees
+            .iter()
+            .filter(|w| w.removable())
+            .map(|w| w.total)
+            .sum()
+    }
+}
+
+/// Find git repositories under `root` and measure/classify their worktrees.
+///
+/// Read-only: no git command run here can take the index lock, and nothing is
+/// written. Returns an empty list when git isn't available.
+pub fn find_git_repos(root: &Path) -> Vec<GitRepo> {
+    if !git_available() {
+        return Vec::new();
+    }
+    let home = home().ok();
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut out: Vec<GitRepo> = Vec::new();
+    walk_git_repos(root, &home, &mut seen, &mut out);
+    out.sort_by_key(|r| std::cmp::Reverse(r.build_bytes() + r.safe_worktree_bytes()));
+    out
+}
+
+fn walk_git_repos(
+    dir: &Path,
+    home: &Option<PathBuf>,
+    seen: &mut Vec<PathBuf>,
+    out: &mut Vec<GitRepo>,
+) {
+    // A `.git` entry means a worktree — of this repo, or a linked one. Either
+    // way `git worktree list` gives us the whole set, so the walk stops here
+    // (which also means submodules are folded into their parent's tree size).
+    if dir.join(".git").exists() {
+        if let Some(repo) = inspect_repo(dir, home, seen) {
+            out.push(repo);
+        }
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() || !ft.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if GIT_SKIP.iter().any(|s| *s == name) {
+            continue;
+        }
+        if name.starts_with('.') && !GIT_DOT_ALLOW.iter().any(|s| *s == name) {
+            continue;
+        }
+        walk_git_repos(&entry.path(), home, seen, out);
+    }
+}
+
+/// Build the `GitRepo` for whichever repository `dir` belongs to, unless it has
+/// already been reported (a linked worktree and its primary are one repo).
+fn inspect_repo(dir: &Path, home: &Option<PathBuf>, seen: &mut Vec<PathBuf>) -> Option<GitRepo> {
+    let raws = worktree_list(dir);
+    // The first entry is always the primary worktree, whichever one we asked.
+    let primary = raws.first()?.path.clone();
+    if seen.contains(&primary) {
+        return None;
+    }
+    seen.push(primary.clone());
+
+    let common = common_git_dir(&primary);
+    let default_branch = default_branch(&primary);
+
+    let mut worktrees: Vec<Worktree> = raws
+        .iter()
+        .enumerate()
+        .map(|(n, raw)| {
+            let kind = if n == 0 {
+                WorktreeKind::Primary
+            } else {
+                WorktreeKind::Linked
+            };
+            measure_worktree(
+                &primary,
+                raw,
+                kind,
+                &common,
+                default_branch.as_deref(),
+                home,
+            )
+        })
+        .collect();
+    // A linked worktree parked *inside* the primary (the `.claude/worktrees/`
+    // convention) is already counted in the primary's tree walk. Discount it,
+    // or the same bytes are offered twice.
+    let nested: u64 = worktrees[1..]
+        .iter()
+        .filter(|w| w.path.starts_with(&primary))
+        .map(|w| w.total)
+        .sum();
+    if nested > 0 {
+        let p = &mut worktrees[0];
+        p.total = p.total.saturating_sub(nested);
+        p.source_bytes = p.total.saturating_sub(p.build_bytes);
+    }
+
+    // Primary stays first; the rest are ordered by what they are holding.
+    worktrees[1..].sort_by_key(|w| std::cmp::Reverse(w.total));
+
+    Some(GitRepo {
+        label: short_label(&primary, home),
+        path: primary,
+        default_branch,
+        worktrees,
+    })
+}
+
+/// One `git worktree list --porcelain` record, before measuring.
+struct RawWorktree {
+    path: PathBuf,
+    head: String,
+    branch: Option<String>,
+    locked: Option<String>,
+    prunable: Option<String>,
+}
+
+/// Parse `git worktree list --porcelain`. Listing does not touch the index.
+fn worktree_list(dir: &Path) -> Vec<RawWorktree> {
+    let Some(text) = git(dir, &["worktree", "list", "--porcelain"]) else {
+        return Vec::new();
+    };
+    let mut out: Vec<RawWorktree> = Vec::new();
+    for line in text.lines() {
+        let (key, value) = match line.split_once(' ') {
+            Some((k, v)) => (k, v.trim()),
+            None => (line.trim(), ""),
+        };
+        match key {
+            "worktree" => out.push(RawWorktree {
+                path: PathBuf::from(value),
+                head: String::new(),
+                branch: None,
+                locked: None,
+                prunable: None,
+            }),
+            "HEAD" => {
+                if let Some(w) = out.last_mut() {
+                    w.head = value.to_string();
+                }
+            }
+            "branch" => {
+                if let Some(w) = out.last_mut() {
+                    w.branch = Some(value.trim_start_matches("refs/heads/").to_string());
+                }
+            }
+            "locked" => {
+                if let Some(w) = out.last_mut() {
+                    w.locked = Some(value.to_string());
+                }
+            }
+            "prunable" => {
+                if let Some(w) = out.last_mut() {
+                    w.prunable = Some(value.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The repository's shared git directory (where `worktrees/` lives).
+fn common_git_dir(primary: &Path) -> PathBuf {
+    git(
+        primary,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .filter(|s| !s.is_empty())
+    .map(PathBuf::from)
+    // `--path-format` needs git 2.31; the layout it reports is the default.
+    .unwrap_or_else(|| primary.join(".git"))
+}
+
+/// The ref the repository's default branch resolves to.
+fn default_branch(primary: &Path) -> Option<String> {
+    if let Some(s) = git(
+        primary,
+        &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+    ) {
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    for r in [
+        "refs/heads/main",
+        "refs/heads/master",
+        "refs/heads/trunk",
+        "refs/heads/develop",
+    ] {
+        if git(primary, &["rev-parse", "--verify", "--quiet", r]).is_some() {
+            return Some(r.to_string());
+        }
+    }
+    None
+}
+
+/// Measure a worktree's tree, split build output from source, and classify it.
+fn measure_worktree(
+    primary: &Path,
+    raw: &RawWorktree,
+    kind: WorktreeKind,
+    common: &Path,
+    default_ref: Option<&str>,
+    home: &Option<PathBuf>,
+) -> Worktree {
+    let total = dir_size(&raw.path);
+    let mut build = Vec::new();
+    walk_build_dirs(&raw.path, home, &mut build);
+    build.sort_by_key(|b| std::cmp::Reverse(b.size));
+    let build_bytes: u64 = build.iter().map(|b| b.size).sum();
+    let admin = admin_entry(common, &raw.path);
+
+    let safety = if kind == WorktreeKind::Primary {
+        WorktreeSafety::Unsafe(
+            "the repository's own checkout — only its build directories are offered".to_string(),
+        )
+    } else {
+        classify_worktree(primary, raw, common, admin.is_some(), default_ref)
+    };
+
+    Worktree {
+        label: short_label(&raw.path, home),
+        path: raw.path.clone(),
+        repo: primary.to_path_buf(),
+        admin,
+        branch: raw.branch.clone(),
+        head: raw.head.clone(),
+        kind,
+        total,
+        build,
+        build_bytes,
+        source_bytes: total.saturating_sub(build_bytes),
+        safety,
+    }
+}
+
+/// Decide whether a linked worktree is safe to remove.
+///
+/// SAFE needs both: nothing uncommitted or untracked outside a build directory,
+/// and content that is already on the default branch — compared by TREE, not by
+/// commit ancestry, because a rebased or cherry-picked branch has different
+/// SHAs and identical content and git calls it "unmerged".
+fn classify_worktree(
+    primary: &Path,
+    raw: &RawWorktree,
+    common: &Path,
+    has_admin: bool,
+    default_ref: Option<&str>,
+) -> WorktreeSafety {
+    let live = raw.path.is_dir();
+
+    // The `prunable` flag is never trusted on its own: git also sets it when a
+    // gitdir pointer simply doesn't resolve, which is exactly what a bind mount
+    // or a relocated repository looks like — with the work still sitting there.
+    if let Some(reason) = &raw.prunable {
+        if live {
+            return WorktreeSafety::Unsafe(format!(
+                "git reports it prunable ({reason}) but the working directory is live — \
+                 a relocated repo or bind mount looks exactly like this"
+            ));
+        }
+        if !has_admin {
+            return WorktreeSafety::Unsafe(
+                "no admin entry and no working directory — nothing left to verify".to_string(),
+            );
+        }
+        return WorktreeSafety::Safe;
+    }
+
+    if !live {
+        return WorktreeSafety::Unsafe("the working directory is missing".to_string());
+    }
+    if !has_admin {
+        return WorktreeSafety::Unsafe(format!(
+            "no admin entry under {}",
+            common.join("worktrees").display()
+        ));
+    }
+    if let Some(lock) = &raw.locked {
+        return WorktreeSafety::Unsafe(if lock.is_empty() {
+            "locked by git".to_string()
+        } else {
+            format!("locked by git: {lock}")
+        });
+    }
+
+    let dirty = dirty_paths(&raw.path);
+    if !dirty.is_empty() {
+        return WorktreeSafety::Unsafe(format!(
+            "{} uncommitted or untracked file{} (e.g. {})",
+            dirty.len(),
+            if dirty.len() == 1 { "" } else { "s" },
+            dirty[0]
+        ));
+    }
+
+    let Some(default_ref) = default_ref else {
+        return WorktreeSafety::Unsafe("no default branch to compare against".to_string());
+    };
+    if raw.head.is_empty() {
+        return WorktreeSafety::Unsafe("HEAD could not be resolved".to_string());
+    }
+    if content_is_on(primary, &raw.head, default_ref) {
+        WorktreeSafety::Safe
+    } else {
+        let what = raw
+            .branch
+            .clone()
+            .unwrap_or_else(|| format!("detached HEAD {}", short_sha(&raw.head)));
+        WorktreeSafety::Unsafe(format!(
+            "{what} has work that is not on {default_ref} — no commit there has this tree"
+        ))
+    }
+}
+
+/// Uncommitted or untracked paths, ignoring anything inside a build directory.
+///
+/// Plumbing only. `diff-index --cached` compares the index to HEAD without
+/// stat'ing the work tree, and neither `diff-files` nor `ls-files` writes the
+/// index — so none of this can leave a `.git/index.lock` behind.
+fn dirty_paths(wt: &Path) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    for args in [
+        &["diff-index", "--cached", "--name-only", "HEAD"][..],
+        &["diff-files", "--name-only"][..],
+        &["ls-files", "--others", "--exclude-standard"][..],
+    ] {
+        if let Some(s) = git(wt, args) {
+            paths.extend(s.lines().map(|l| l.trim().to_string()));
+        }
+    }
+    paths.retain(|p| !p.is_empty() && !in_build_dir(p));
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// True when a repo-relative path lies inside a regenerable build directory.
+/// Those are reclaimed on their own and never make a worktree unsafe.
+fn in_build_dir(rel: &str) -> bool {
+    rel.split('/').any(|c| BUILD_DIRS.contains(&c))
+}
+
+/// Whether the content at `tip` is already present on `default_ref`.
+///
+/// Two ways it can be: the tip is an ancestor (an ordinary merged branch), or
+/// some commit on the default branch has the identical tree (rebased, squashed
+/// or cherry-picked — different SHA, same content, and git calls it unmerged).
+fn content_is_on(repo: &Path, tip: &str, default_ref: &str) -> bool {
+    if git_ok(repo, &["merge-base", "--is-ancestor", tip, default_ref]) {
+        return true;
+    }
+    let Some(tip_tree) = git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{tip}^{{tree}}"),
+        ],
+    ) else {
+        return false;
+    };
+    let depth = TREE_SCAN_DEPTH.to_string();
+    let Some(trees) = git(repo, &["log", "-n", &depth, "--format=%T", default_ref]) else {
+        return false;
+    };
+    trees.lines().any(|t| t.trim() == tip_tree)
+}
+
+/// The `<common>/worktrees/<name>` admin entry that owns `wt`.
+///
+/// Matched by the recorded `gitdir` pointer rather than guessed from the
+/// directory name — git suffixes duplicates, so the names diverge.
+fn admin_entry(common: &Path, wt: &Path) -> Option<String> {
+    for e in fs::read_dir(common.join("worktrees")).ok()?.flatten() {
+        let Ok(pointer) = fs::read_to_string(e.path().join("gitdir")) else {
+            continue;
+        };
+        // The pointer names `<worktree>/.git`, so compare its parent.
+        if PathBuf::from(pointer.trim()).parent() == Some(wt) {
+            return Some(e.file_name().to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+/// Collect the regenerable build directories inside a worktree.
+///
+/// Prunes at each hit (nested output is counted in its parent's total), skips
+/// symlinks, skips `.git`, skips dotdirs that aren't themselves build output,
+/// and never descends into a nested worktree — whose build dirs belong to it.
+fn walk_build_dirs(dir: &Path, home: &Option<PathBuf>, out: &mut Vec<BuildDir>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() || !ft.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if BUILD_DIRS.contains(&name.as_ref()) {
+            let path = entry.path();
+            let size = dir_size(&path);
+            out.push(BuildDir {
+                label: short_label(&path, home),
+                path,
+                size,
+            });
+            continue;
+        }
+        if name == ".git" || name.starts_with('.') {
+            continue;
+        }
+        let child = entry.path();
+        if child.join(".git").exists() {
+            continue; // a worktree of its own
+        }
+        walk_build_dirs(&child, home, out);
+    }
+}
+
+/// Delete a regenerable build directory. Safe inside an UNSAFE worktree too —
+/// it is build output either way.
+pub fn clean_build_dir(path: &Path) -> io::Result<()> {
+    if path.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        Ok(())
+    }
+}
+
+/// Remove a SAFE linked worktree, keeping its commits reachable.
+///
+/// Tags the branch tip as `archive/<branch>` first, so nothing is ever made
+/// unreachable by this, then removes the directory, prunes the admin entry, and
+/// finally deletes the branch. Refuses anything not classified SAFE.
+pub fn remove_worktree(wt: &Worktree) -> Result<String, String> {
+    if wt.kind == WorktreeKind::Primary {
+        return Err("refusing to remove a repository's own checkout".to_string());
+    }
+    if let Some(reason) = wt.safety.reason() {
+        return Err(format!("refusing to remove an unsafe worktree: {reason}"));
+    }
+    if !git_available() {
+        return Err("git is not available".to_string());
+    }
+
+    let mut log: Vec<String> = Vec::new();
+    let tag = wt.archive_tag();
+
+    // 1. Archive the tip so the commits stay reachable after the branch goes.
+    if !wt.head.is_empty() {
+        if git(&wt.repo, &["tag", "-f", &tag, &wt.head]).is_none() {
+            return Err(format!("could not tag {} at {}", tag, short_sha(&wt.head)));
+        }
+        log.push(format!("tagged {tag} at {}", short_sha(&wt.head)));
+    }
+
+    // 2. Remove the working directory.
+    if wt.path.is_dir() {
+        fs::remove_dir_all(&wt.path).map_err(|e| format!("{}: {e}", wt.path.display()))?;
+        log.push(format!("removed {}", wt.label));
+    }
+
+    // 3. Drop the admin entry.
+    if git(&wt.repo, &["worktree", "prune"]).is_none() {
+        log.push("git worktree prune reported an error".to_string());
+    } else {
+        log.push("pruned the worktree admin entry".to_string());
+    }
+
+    // 4. Delete the branch. Non-fatal: the archive tag already holds the work.
+    if let Some(branch) = &wt.branch {
+        if git(&wt.repo, &["branch", "-D", branch]).is_some() {
+            log.push(format!("deleted branch {branch} (kept as {tag})"));
+        } else {
+            log.push(format!("branch {branch} was left in place (kept as {tag})"));
+        }
+    }
+    Ok(log.join("\n"))
+}
+
+/// First 8 characters of a commit id, for messages.
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(8).collect()
 }
 
 /// Recursively sum the size of a directory, not following symlinks.
@@ -1537,6 +2252,362 @@ mod tests {
                 "template coverage at {px}px was {frac:.3}"
             );
         }
+    }
+
+    // --- git worktrees ---------------------------------------------------
+    //
+    // Fixtures are real repositories in a tempdir. Setup runs git with the
+    // user's global/system config disabled so a stray `core.excludesFile` or
+    // `commit.gpgsign` can't change what these assert.
+
+    /// Run git for FIXTURE SETUP (this one is allowed to write).
+    fn git_fx(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new(git_bin())
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "sweepmac test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+            .env("GIT_COMMITTER_NAME", "sweepmac test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A fixture root holding `repo/` with one commit on `main`.
+    fn init_repo(name: &str) -> PathBuf {
+        let root = scratch_dir(name);
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git_fx(&repo, &["init", "-q", "-b", "main", "."]);
+        fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git_fx(&repo, &["add", "-A"]);
+        git_fx(&repo, &["commit", "-qm", "one"]);
+        root
+    }
+
+    /// Add `wt/` on a new branch whose tip tree is identical to a *different*
+    /// commit later made on `main` — the rebase / cherry-pick shape.
+    fn add_rebased_worktree(root: &Path) -> PathBuf {
+        let repo = root.join("repo");
+        let wt = root.join("wt");
+        git_fx(&repo, &["worktree", "add", "-q", "-b", "feat", "../wt"]);
+        fs::write(wt.join("b.txt"), "two\n").unwrap();
+        git_fx(&wt, &["add", "-A"]);
+        git_fx(&wt, &["commit", "-qm", "add b on the branch"]);
+        // The same content lands on main under a different commit id.
+        fs::write(repo.join("b.txt"), "two\n").unwrap();
+        git_fx(&repo, &["add", "-A"]);
+        git_fx(&repo, &["commit", "-qm", "add b, rewritten on main"]);
+        wt
+    }
+
+    fn linked(root: &Path) -> Vec<Worktree> {
+        find_git_repos(root)
+            .into_iter()
+            .flat_map(|r| r.worktrees)
+            .filter(|w| w.kind == WorktreeKind::Linked)
+            .collect()
+    }
+
+    /// The one linked worktree a fixture has.
+    fn only_linked(root: &Path) -> Worktree {
+        let mut v = linked(root);
+        assert_eq!(v.len(), 1, "expected exactly one linked worktree");
+        v.remove(0)
+    }
+
+    #[test]
+    fn rebased_branch_with_an_identical_tree_is_safe() {
+        if !git_available() {
+            return;
+        }
+        let root = init_repo("git-rebased");
+        let wt = add_rebased_worktree(&root);
+
+        // The premise: different commit, same content, and git says "unmerged".
+        let repo = root.join("repo");
+        let tip = git_fx(&wt, &["rev-parse", "HEAD"]);
+        let main = git_fx(&repo, &["rev-parse", "main"]);
+        assert_ne!(tip, main, "the fixture must have diverged SHAs");
+        assert_eq!(
+            git_fx(&wt, &["rev-parse", "HEAD^{tree}"]),
+            git_fx(&repo, &["rev-parse", "main^{tree}"]),
+            "the fixture must have identical trees"
+        );
+
+        let w = only_linked(&root);
+        assert_eq!(w.branch.as_deref(), Some("feat"));
+        assert_eq!(w.safety, WorktreeSafety::Safe, "{:?}", w.safety);
+        assert!(w.removable());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn genuinely_unmerged_branch_is_unsafe() {
+        if !git_available() {
+            return;
+        }
+        let root = init_repo("git-unmerged");
+        let repo = root.join("repo");
+        let wt = root.join("wt");
+        git_fx(&repo, &["worktree", "add", "-q", "-b", "feat", "../wt"]);
+        fs::write(wt.join("c.txt"), "only on the branch\n").unwrap();
+        git_fx(&wt, &["add", "-A"]);
+        git_fx(&wt, &["commit", "-qm", "work that never landed"]);
+
+        let w = only_linked(&root);
+        assert!(!w.safety.is_safe());
+        assert!(
+            w.safety.reason().unwrap().contains("not on"),
+            "reason was: {:?}",
+            w.safety.reason()
+        );
+        assert!(!w.removable());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn worktree_with_uncommitted_changes_is_unsafe() {
+        if !git_available() {
+            return;
+        }
+        let root = init_repo("git-dirty");
+        let wt = add_rebased_worktree(&root);
+        // Content-wise this worktree is already on main; the edit is the only
+        // thing standing between it and SAFE.
+        fs::write(wt.join("scratch-note.md"), "unsaved thinking\n").unwrap();
+
+        let w = only_linked(&root);
+        assert!(!w.safety.is_safe());
+        assert!(
+            w.safety
+                .reason()
+                .unwrap()
+                .contains("uncommitted or untracked"),
+            "reason was: {:?}",
+            w.safety.reason()
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn worktree_dirty_only_with_build_output_is_safe() {
+        if !git_available() {
+            return;
+        }
+        let root = init_repo("git-buildonly");
+        let wt = add_rebased_worktree(&root);
+        // Untracked and NOT gitignored: build output must be discounted on its
+        // name, not on whether the project happened to ignore it.
+        fs::create_dir_all(wt.join("target/debug")).unwrap();
+        fs::write(wt.join("target/debug/bin"), vec![0u8; 4096]).unwrap();
+        fs::create_dir_all(wt.join("node_modules/left-pad")).unwrap();
+        fs::write(wt.join("node_modules/left-pad/index.js"), "x").unwrap();
+
+        let w = only_linked(&root);
+        assert_eq!(w.safety, WorktreeSafety::Safe, "{:?}", w.safety);
+        assert_eq!(w.build.len(), 2, "both build dirs should be reported");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn prunable_flag_alone_never_makes_a_live_worktree_removable() {
+        if !git_available() {
+            return;
+        }
+        let root = init_repo("git-relocated");
+        let wt = add_rebased_worktree(&root);
+        // A relocated repo / bind mount looks exactly like this: git cannot
+        // resolve the gitdir pointer and flags it prunable, while the working
+        // directory is sitting right there.
+        fs::remove_file(wt.join(".git")).unwrap();
+        assert!(
+            git_fx(&root.join("repo"), &["worktree", "list", "--porcelain"]).contains("prunable"),
+            "the fixture must actually be flagged prunable"
+        );
+
+        let w = only_linked(&root);
+        assert!(wt.is_dir(), "the working directory is still live");
+        assert!(!w.safety.is_safe(), "prunable must not imply removable");
+        assert!(
+            w.safety.reason().unwrap().contains("prunable"),
+            "reason was: {:?}",
+            w.safety.reason()
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn build_dir_sizing_excludes_source() {
+        if !git_available() {
+            return;
+        }
+        let root = init_repo("git-sizing");
+        let wt = add_rebased_worktree(&root);
+        fs::create_dir_all(wt.join("target/debug")).unwrap();
+        fs::write(wt.join("target/debug/blob"), vec![7u8; 512 * 1024]).unwrap();
+
+        let w = only_linked(&root);
+        assert_eq!(w.build.len(), 1);
+        // git reports symlink-resolved paths (/private/var vs /var on macOS),
+        // so compare the part of the path that is ours.
+        assert!(
+            w.build[0].path.ends_with("wt/target"),
+            "{:?}",
+            w.build[0].path
+        );
+        assert!(
+            w.build_bytes >= 512 * 1024,
+            "build bytes were {}",
+            w.build_bytes
+        );
+        // The source side is a handful of small text files, so the split has to
+        // put nearly everything on the build side.
+        assert!(
+            w.source_bytes < w.build_bytes / 4,
+            "source {} vs build {}",
+            w.source_bytes,
+            w.build_bytes
+        );
+        assert_eq!(w.total, w.build_bytes + w.source_bytes);
+        // And the primary's own build dirs are reported too.
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join("target")).unwrap();
+        fs::write(repo.join("target/blob"), vec![7u8; 256 * 1024]).unwrap();
+        let repos = find_git_repos(&root);
+        let primary = repos[0]
+            .worktrees
+            .iter()
+            .find(|w| w.kind == WorktreeKind::Primary)
+            .unwrap();
+        assert!(primary.build_bytes >= 256 * 1024);
+        assert!(
+            !primary.safety.is_safe(),
+            "a repository's own checkout is never removable"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn discovery_leaves_no_index_lock_behind() {
+        if !git_available() {
+            return;
+        }
+        let root = init_repo("git-nolock");
+        let wt = add_rebased_worktree(&root);
+        // Give the walk every reason to want a refreshed index: an edit, an
+        // untracked file, and build output.
+        fs::write(wt.join("a.txt"), "one\nedited\n").unwrap();
+        fs::write(wt.join("untracked.txt"), "x").unwrap();
+        fs::create_dir_all(wt.join("dist")).unwrap();
+        fs::write(wt.join("dist/out.js"), "y").unwrap();
+
+        let repos = find_git_repos(&root);
+        assert_eq!(repos.len(), 1, "the linked worktree must not double-count");
+        assert_eq!(repos[0].worktrees.len(), 2);
+
+        let locks = find_named(&root, "index.lock");
+        assert!(
+            locks.is_empty(),
+            "discovery left index locks behind: {locks:?}"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Every path under `dir` whose file name is `name`.
+    fn find_named(dir: &Path, name: &str) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let Ok(entries) = fs::read_dir(dir) else {
+            return out;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if e.file_name().to_string_lossy() == name {
+                out.push(p.clone());
+            }
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                out.extend(find_named(&p, name));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn git_category_is_opt_in() {
+        assert!(ALL_CATEGORIES.contains(&"git"));
+        assert!(!DEFAULT_CLEAN_CATEGORIES.contains(&"git"));
+        // It is a discovery category, so it deliberately has no TARGETS rows.
+        assert!(!TARGETS.iter().any(|t| t.category == "git"));
+    }
+
+    #[test]
+    fn build_dir_paths_are_recognised_by_component() {
+        assert!(in_build_dir("target/debug/foo"));
+        assert!(in_build_dir("web/node_modules/left-pad/index.js"));
+        assert!(in_build_dir("api/__pycache__/mod.pyc"));
+        assert!(!in_build_dir("src/target_practice.rs"));
+        assert!(!in_build_dir("README.md"));
+        assert!(!in_build_dir("src/builder.rs"));
+    }
+
+    #[test]
+    fn archive_tag_names_survive_a_detached_head() {
+        let mut w = Worktree {
+            path: PathBuf::from("/tmp/wt"),
+            label: "~/wt".into(),
+            repo: PathBuf::from("/tmp/repo"),
+            admin: Some("wt".into()),
+            branch: Some("feature/login".into()),
+            head: "0123456789abcdef".into(),
+            kind: WorktreeKind::Linked,
+            total: 0,
+            build: Vec::new(),
+            build_bytes: 0,
+            source_bytes: 0,
+            safety: WorktreeSafety::Safe,
+        };
+        assert_eq!(w.archive_tag(), "archive/feature/login");
+        w.branch = None;
+        assert_eq!(w.archive_tag(), "archive/detached-01234567");
+    }
+
+    #[test]
+    fn remove_worktree_refuses_anything_not_classified_safe() {
+        let w = Worktree {
+            path: PathBuf::from("/tmp/wt"),
+            label: "~/wt".into(),
+            repo: PathBuf::from("/tmp/repo"),
+            admin: Some("wt".into()),
+            branch: Some("feat".into()),
+            head: "deadbeef".into(),
+            kind: WorktreeKind::Linked,
+            total: 0,
+            build: Vec::new(),
+            build_bytes: 0,
+            source_bytes: 0,
+            safety: WorktreeSafety::Unsafe("2 uncommitted files".into()),
+        };
+        let err = remove_worktree(&w).unwrap_err();
+        assert!(err.contains("unsafe"), "{err}");
+        assert!(w.path.exists() || !w.path.exists()); // nothing was touched
+
+        let primary = Worktree {
+            kind: WorktreeKind::Primary,
+            safety: WorktreeSafety::Safe,
+            ..w
+        };
+        assert!(remove_worktree(&primary)
+            .unwrap_err()
+            .contains("own checkout"));
     }
 
     #[test]
