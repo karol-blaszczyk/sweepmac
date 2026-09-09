@@ -1,5 +1,8 @@
 # sweepmac
 
+[![ci](https://github.com/karol-blaszczyk/sweepmac/actions/workflows/ci.yml/badge.svg)](https://github.com/karol-blaszczyk/sweepmac/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A tiny macOS cleanup helper. Finds regenerable caches (the kind that rebuild
 themselves on next use), reports how much space each is holding, and clears the
 ones you pick.
