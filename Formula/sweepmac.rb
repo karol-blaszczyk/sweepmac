@@ -3,8 +3,8 @@ class Sweepmac < Formula
   homepage "https://github.com/karol-blaszczyk/sweepmac"
   url "https://github.com/karol-blaszczyk/sweepmac.git",
       using: :git,
-      tag:   "v0.2.0"
-  version "0.2.0"
+      tag:   "v0.3.0"
+  version "0.3.0"
   license "MIT"
   head "https://github.com/karol-blaszczyk/sweepmac.git", using: :git, branch: "main"
 

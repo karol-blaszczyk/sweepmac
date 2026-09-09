@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.3.0 — 2026-09-09
 
 - New opt-in `git` category: finds git worktrees under a root (agents park
   them under `.claude/worktrees/` and `~/.claude-worktrees/`, each carrying a
