@@ -468,6 +468,7 @@ pub fn activity_section(
     entries: &[Activity],
     open: bool,
     running: Option<(&str, u64)>,
+    live: &[String],
 ) {
     let id = ui.make_persistent_id("recent_activity");
     let mut state =
@@ -497,8 +498,33 @@ pub fn activity_section(
                 });
             })
             .body(|ui| {
+                if running.is_some() {
+                    if live.is_empty() {
+                        ui.label(style::meta(t, "starting…"));
+                    } else {
+                        ui.label(style::meta(t, "In progress"));
+                        egui::ScrollArea::vertical()
+                            .id_salt("live_log")
+                            .max_height(120.0)
+                            .auto_shrink([false, true])
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                for line in live.iter().rev().take(8).rev() {
+                                    ui.label(
+                                        RichText::new(line)
+                                            .size(style::T_META)
+                                            .monospace()
+                                            .color(t.text_secondary),
+                                    );
+                                }
+                            });
+                        ui.add_space(8.0);
+                    }
+                }
                 if entries.is_empty() {
-                    ui.label(style::meta(t, "No cleanups run in this session."));
+                    if running.is_none() {
+                        ui.label(style::meta(t, "No cleanups run in this session."));
+                    }
                     return;
                 }
                 egui::ScrollArea::vertical()

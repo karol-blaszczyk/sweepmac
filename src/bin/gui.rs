@@ -598,6 +598,7 @@ impl App {
         self.phase = Phase::Working;
         self.log.clear();
         self.started = Some(Instant::now());
+        self.activity_open = true;
         self.status = format!("Cleaning {} item{}…", jobs.len(), w::plural(jobs.len()));
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
         self.work_rx = Some(rx);
@@ -717,6 +718,7 @@ impl App {
         self.phase = Phase::Working;
         self.log.clear();
         self.started = Some(Instant::now());
+        self.activity_open = true;
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
         self.work_rx = Some(rx);
         let ctx = self.ctx.clone();
@@ -754,6 +756,7 @@ impl App {
         self.phase = Phase::Working;
         self.log.clear();
         self.started = Some(Instant::now());
+        self.activity_open = true;
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
         self.work_rx = Some(rx);
         let ctx = self.ctx.clone();
@@ -797,6 +800,7 @@ impl App {
         self.phase = Phase::Working;
         self.log.clear();
         self.started = Some(Instant::now());
+        self.activity_open = true;
         self.status = format!("Removing {}…", r.wt.label);
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
         self.work_rx = Some(rx);
@@ -830,6 +834,7 @@ impl App {
         self.phase = Phase::Working;
         self.log.clear();
         self.started = Some(Instant::now());
+        self.activity_open = true;
         self.status = "Waiting for your admin password…".into();
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
         self.work_rx = Some(rx);
@@ -1235,6 +1240,7 @@ impl App {
                             std::mem::take(&mut self.activity_open),
                             (self.phase == Phase::Working)
                                 .then(|| (self.status.as_str(), self.elapsed_secs())),
+                            &self.log,
                         );
                         ui.add_space(8.0);
                     });
