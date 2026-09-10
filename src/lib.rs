@@ -4,11 +4,13 @@
 //! catalogue only ever points at regenerable caches.
 
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Directories where `docker` commonly lives but which GUI apps launched from
 /// Finder/Dock/Spotlight don't inherit (they get a minimal system PATH, not
@@ -49,6 +51,62 @@ pub fn docker_bin() -> &'static str {
 /// shell PATH (see `docker_bin`).
 fn docker_cmd() -> Command {
     Command::new(docker_bin())
+}
+
+/// Deadline for a read-only Docker query (`system df`, `volume ls`,
+/// `images`). A stalled colima VM must degrade to "not reachable", not hang
+/// the caller forever. Prune/rm commands are exempt — those legitimately run
+/// for minutes and are covered by the GUI's own Cancel button instead.
+const DOCKER_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Run `cmd`, killing it and returning `None` if it hasn't finished within
+/// `timeout`. A read-only Docker query has no business running longer than
+/// this — a stalled colima VM would otherwise leave the caller blocked
+/// indefinitely, since a plain `Command::output()` has no deadline at all.
+fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<Output> {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let stdout_thread = thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = &mut stdout_pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_thread = thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = &mut stderr_pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(_) => break None,
+        }
+    };
+    let status = status?;
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+    Some(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// A directory we know how to clean.
@@ -1362,10 +1420,10 @@ pub fn extras() -> Vec<(&'static str, PathBuf, u64)> {
 /// How much `docker builder/image prune -af` would reclaim inside the VM, in
 /// bytes (images + build cache). `None` if Docker isn't reachable.
 pub fn docker_reclaimable() -> Option<u64> {
-    let out = docker_cmd()
-        .args(["system", "df", "--format", "{{.Type}}\t{{.Reclaimable}}"])
-        .output()
-        .ok()?;
+    let out = output_with_timeout(
+        docker_cmd().args(["system", "df", "--format", "{{.Type}}\t{{.Reclaimable}}"]),
+        DOCKER_QUERY_TIMEOUT,
+    )?;
     if !out.status.success() {
         return None;
     }
@@ -1455,10 +1513,10 @@ pub fn docker_info() -> Option<DockerInfo> {
 /// query is currently in flight.
 pub fn docker_info_with(on_step: &mut dyn FnMut(&str)) -> Option<DockerInfo> {
     on_step("docker system df");
-    let df = docker_cmd()
-        .args(["system", "df", "--format", "{{.Type}}\t{{.Reclaimable}}"])
-        .output()
-        .ok()?;
+    let df = output_with_timeout(
+        docker_cmd().args(["system", "df", "--format", "{{.Type}}\t{{.Reclaimable}}"]),
+        DOCKER_QUERY_TIMEOUT,
+    )?;
     if !df.status.success() {
         return None;
     }
@@ -1486,30 +1544,30 @@ pub fn docker_info_with(on_step: &mut dyn FnMut(&str)) -> Option<DockerInfo> {
 
 /// List Docker images with sizes and best-effort in-use status.
 fn docker_images() -> Vec<DockerImage> {
-    let out = match docker_cmd()
-        .args([
+    let out = match output_with_timeout(
+        docker_cmd().args([
             "images",
             "--format",
             "{{.ID}}|{{.Repository}}:{{.Tag}}|{{.Size}}",
-        ])
-        .output()
-    {
-        Ok(o) if o.status.success() => o,
+        ]),
+        DOCKER_QUERY_TIMEOUT,
+    ) {
+        Some(o) if o.status.success() => o,
         _ => return Vec::new(),
     };
 
     // Image references used by any container (running or stopped).
-    let used: Vec<String> = docker_cmd()
-        .args(["ps", "-a", "--format", "{{.Image}}"])
-        .output()
-        .ok()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(|l| l.trim().to_string())
-                .collect()
-        })
-        .unwrap_or_default();
+    let used: Vec<String> = output_with_timeout(
+        docker_cmd().args(["ps", "-a", "--format", "{{.Image}}"]),
+        DOCKER_QUERY_TIMEOUT,
+    )
+    .map(|o| {
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .collect()
+    })
+    .unwrap_or_default();
 
     let text = String::from_utf8_lossy(&out.stdout);
     let mut images: Vec<DockerImage> = Vec::new();
@@ -1574,8 +1632,11 @@ pub fn docker_image_rm(ids: &[String]) -> Result<String, String> {
 
 /// Per-volume name, size, and in-use status, parsed from `docker system df -v`.
 fn docker_volumes() -> Vec<DockerVolume> {
-    let out = match docker_cmd().args(["system", "df", "-v"]).output() {
-        Ok(o) if o.status.success() => o,
+    let out = match output_with_timeout(
+        docker_cmd().args(["system", "df", "-v"]),
+        DOCKER_QUERY_TIMEOUT,
+    ) {
+        Some(o) if o.status.success() => o,
         _ => return Vec::new(),
     };
     let text = String::from_utf8_lossy(&out.stdout);
@@ -2187,6 +2248,20 @@ mod tests {
         assert!(found[0].ends_with("node_modules"));
         assert_eq!(out.len(), 1);
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn output_with_timeout_kills_a_command_that_overruns_the_deadline() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("5");
+        assert!(output_with_timeout(&mut cmd, Duration::from_millis(100)).is_none());
+    }
+
+    #[test]
+    fn output_with_timeout_returns_output_for_a_command_that_finishes_in_time() {
+        let mut cmd = Command::new("true");
+        let out = output_with_timeout(&mut cmd, Duration::from_secs(5));
+        assert!(out.is_some_and(|o| o.status.success()));
     }
 
     // --- selection model -------------------------------------------------

@@ -394,14 +394,21 @@ pub fn select_row(ui: &mut egui::Ui, t: &Tokens, v: RowView<'_>) -> bool {
 
 /// The persistent contextual action bar. Returns true when the primary action
 /// is clicked.
+pub struct ActionBarResult {
+    pub review_clicked: bool,
+    pub cancel_clicked: bool,
+}
+
 pub fn action_bar(
     ui: &mut egui::Ui,
     t: &Tokens,
     summary: SelectionSummary,
     enabled: bool,
     busy_label: Option<&str>,
-) -> bool {
-    let mut clicked = false;
+    cancel_pending: bool,
+) -> ActionBarResult {
+    let mut review_clicked = false;
+    let mut cancel_clicked = false;
     ui.horizontal(|ui| {
         if let Some(busy) = busy_label {
             ui.add(egui::Spinner::new().size(14.0).color(t.accent));
@@ -438,20 +445,31 @@ pub fn action_bar(
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let resp = ui.add_enabled(enabled, style::primary_button(t, "Review & Clean"));
-            if resp.clicked() {
-                clicked = true;
-            }
-            if !enabled {
-                resp.on_disabled_hover_text(if busy_label.is_some() {
-                    "Waiting for the current operation to finish"
+            if busy_label.is_some() {
+                let resp = ui.add_enabled(!cancel_pending, style::quiet_button(t, "Cancel"));
+                if resp.clicked() {
+                    cancel_clicked = true;
+                }
+                resp.on_hover_text(if cancel_pending {
+                    "Stopping after the current item…"
                 } else {
-                    "Tick at least one cache to enable cleaning"
+                    "Stops after the current item finishes"
                 });
+            } else {
+                let resp = ui.add_enabled(enabled, style::primary_button(t, "Review & Clean"));
+                if resp.clicked() {
+                    review_clicked = true;
+                }
+                if !enabled {
+                    resp.on_disabled_hover_text("Tick at least one cache to enable cleaning");
+                }
             }
         });
     });
-    clicked
+    ActionBarResult {
+        review_clicked,
+        cancel_clicked,
+    }
 }
 
 /// One entry in Recent activity.

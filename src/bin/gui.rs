@@ -13,10 +13,12 @@
 mod ui;
 
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -287,6 +289,12 @@ struct App {
     nm_rx: Option<Receiver<Msg>>,
     docker_rx: Option<Receiver<Msg>>,
     git_rx: Option<Receiver<Msg>>,
+
+    /// Set to stop a running batch after its current item. Reset at the start
+    /// of each `run_*`. Scans are read-only and are never cancelled by this —
+    /// only the destructive/slow work in `run_jobs`/`run_danger`/
+    /// `run_docker_action` checks it.
+    cancel: Arc<AtomicBool>,
 }
 
 impl App {
@@ -332,6 +340,7 @@ impl App {
             nm_rx: None,
             docker_rx: None,
             git_rx: None,
+            cancel: Arc::new(AtomicBool::new(false)),
         };
         app.start_scan();
         app.start_nm_scan();
@@ -694,15 +703,26 @@ impl App {
         self.started = Some(Instant::now());
         self.last_progress = Some(Instant::now());
         self.activity_open = true;
+        self.cancel.store(false, Ordering::Relaxed);
         self.status = format!("Cleaning {} item{}…", jobs.len(), w::plural(jobs.len()));
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
         self.work_rx = Some(rx);
         let ctx = self.ctx.clone();
+        let cancel = Arc::clone(&self.cancel);
         thread::spawn(move || {
             let mut freed = 0u64;
             let mut failures = 0usize;
+            let mut ran = 0usize;
             let count = jobs.len();
             for (i, job) in jobs.into_iter().enumerate() {
+                if cancel.load(Ordering::Relaxed) {
+                    let remaining = count - i;
+                    let _ = tx.send(Msg::Log(format!(
+                        "cancelled — {remaining} item{} not run",
+                        w::plural(remaining)
+                    )));
+                    break;
+                }
                 let _ = tx.send(Msg::Progress {
                     done: i,
                     total: count,
@@ -740,7 +760,7 @@ impl App {
                         };
                         let _ = tx.send(Msg::Log(format!("$ docker {} — {label}", args.join(" "))));
                         ctx.request_repaint();
-                        if !stream(&tx, &ctx, sweepmac::docker_bin(), args) {
+                        if !stream(&tx, &ctx, &cancel, sweepmac::docker_bin(), args) {
                             failures += 1;
                         }
                     }
@@ -778,15 +798,29 @@ impl App {
                     Job::Simulators => {
                         let _ = tx.send(Msg::Log("$ xcrun simctl delete unavailable".into()));
                         ctx.request_repaint();
-                        if !stream(&tx, &ctx, "xcrun", &["simctl", "delete", "unavailable"]) {
+                        if !stream(
+                            &tx,
+                            &ctx,
+                            &cancel,
+                            "xcrun",
+                            &["simctl", "delete", "unavailable"],
+                        ) {
                             failures += 1;
                         }
                     }
                 }
+                ran += 1;
                 ctx.request_repaint();
             }
-            let ok = failures == 0;
-            let summary = if ok {
+            let cancelled = cancel.load(Ordering::Relaxed) && ran < count;
+            let ok = failures == 0 && !cancelled;
+            let summary = if cancelled {
+                format!(
+                    "Cancelled after {ran} of {count} item{} · {} reclaimed",
+                    w::plural(ran),
+                    human(freed)
+                )
+            } else if ok {
                 if freed > 0 {
                     format!(
                         "Cleaned {count} item{} · {}",
@@ -821,9 +855,11 @@ impl App {
         self.started = Some(Instant::now());
         self.last_progress = Some(Instant::now());
         self.activity_open = true;
+        self.cancel.store(false, Ordering::Relaxed);
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
         self.work_rx = Some(rx);
         let ctx = self.ctx.clone();
+        let cancel = Arc::clone(&self.cancel);
         match d {
             Danger::DockerVolumes { names, total } => {
                 self.status = format!(
@@ -836,7 +872,13 @@ impl App {
                     for name in &names {
                         let _ = tx.send(Msg::Log(format!("$ docker volume rm {name}")));
                         ctx.request_repaint();
-                        let _ = stream(&tx, &ctx, sweepmac::docker_bin(), &["volume", "rm", name]);
+                        let _ = stream(
+                            &tx,
+                            &ctx,
+                            &cancel,
+                            sweepmac::docker_bin(),
+                            &["volume", "rm", name],
+                        );
                     }
                     let _ = tx.send(Msg::Done {
                         freed: 0,
@@ -860,9 +902,11 @@ impl App {
         self.started = Some(Instant::now());
         self.last_progress = Some(Instant::now());
         self.activity_open = true;
+        self.cancel.store(false, Ordering::Relaxed);
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
         self.work_rx = Some(rx);
         let ctx = self.ctx.clone();
+        let cancel = Arc::clone(&self.cancel);
         match a {
             DockerAction::RemoveImages { ids, names, total } => {
                 self.status = format!("Removing {} image{}…", names.len(), w::plural(names.len()));
@@ -872,7 +916,7 @@ impl App {
                     ctx.request_repaint();
                     let mut args = vec!["rmi"];
                     args.extend(ids.iter().map(|s| s.as_str()));
-                    let ok = stream(&tx, &ctx, sweepmac::docker_bin(), &args);
+                    let ok = stream(&tx, &ctx, &cancel, sweepmac::docker_bin(), &args);
                     let summary = if ok {
                         format!(
                             "Removed {count} image{} ({})",
@@ -905,6 +949,7 @@ impl App {
         self.started = Some(Instant::now());
         self.last_progress = Some(Instant::now());
         self.activity_open = true;
+        self.cancel.store(false, Ordering::Relaxed);
         self.status = format!("Removing {}…", r.wt.label);
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
         self.work_rx = Some(rx);
@@ -940,6 +985,7 @@ impl App {
         self.started = Some(Instant::now());
         self.last_progress = Some(Instant::now());
         self.activity_open = true;
+        self.cancel.store(false, Ordering::Relaxed);
         self.status = "Waiting for your admin password…".into();
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
         self.work_rx = Some(rx);
@@ -1366,8 +1412,21 @@ impl App {
                     None => self.status.clone(),
                 });
                 let enabled = action_enabled(summary, busy);
-                if w::action_bar(ui, &t, summary, enabled, busy_label.as_deref()) {
+                let cancel_pending = self.cancel.load(Ordering::Relaxed);
+                let res = w::action_bar(
+                    ui,
+                    &t,
+                    summary,
+                    enabled,
+                    busy_label.as_deref(),
+                    cancel_pending,
+                );
+                if res.review_clicked {
                     self.review = self.build_review();
+                }
+                if res.cancel_clicked {
+                    self.cancel.store(true, Ordering::Relaxed);
+                    self.status = "Cancelling after the current item…".into();
                 }
             });
     }
@@ -2665,7 +2724,20 @@ impl App {
 /// Run an external command, forwarding each stdout/stderr line to the UI so
 /// progress is visible live. Blocks until the command exits; returns whether
 /// it ran and exited successfully.
-fn stream(tx: &Sender<Msg>, ctx: &egui::Context, prog: &str, args: &[&str]) -> bool {
+/// Run `prog` and stream its output as `Msg::Log` lines, polling `cancel` so
+/// a click on Cancel kills it instead of waiting for it to exit on its own.
+///
+/// stdout and stderr are drained on separate threads: reading one pipe to EOF
+/// before touching the other deadlocks as soon as the child fills the other
+/// pipe's OS buffer (64 KB) and blocks on write — a real risk for `docker
+/// prune`/`xcrun simctl`, which can write plenty to both.
+fn stream(
+    tx: &Sender<Msg>,
+    ctx: &egui::Context,
+    cancel: &AtomicBool,
+    prog: &str,
+    args: &[&str],
+) -> bool {
     let mut child = match Command::new(prog)
         .args(args)
         .stdout(Stdio::piped())
@@ -2679,17 +2751,48 @@ fn stream(tx: &Sender<Msg>, ctx: &egui::Context, prog: &str, args: &[&str]) -> b
             return false;
         }
     };
-    if let Some(out) = child.stdout.take() {
-        for line in BufReader::new(out).lines().map_while(Result::ok) {
-            let _ = tx.send(Msg::Log(line));
+    let pipes: Vec<Box<dyn Read + Send>> = [
+        child
+            .stdout
+            .take()
+            .map(|o| Box::new(o) as Box<dyn Read + Send>),
+        child
+            .stderr
+            .take()
+            .map(|e| Box::new(e) as Box<dyn Read + Send>),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let readers: Vec<thread::JoinHandle<()>> = pipes
+        .into_iter()
+        .map(|pipe| {
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            thread::spawn(move || {
+                for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                    let _ = tx.send(Msg::Log(line));
+                    ctx.request_repaint();
+                }
+            })
+        })
+        .collect();
+    let mut killed = false;
+    let status = loop {
+        if !killed && cancel.load(Ordering::Relaxed) {
+            killed = true;
+            let _ = child.kill();
+            let _ = tx.send(Msg::Log(format!("killed {prog}")));
             ctx.request_repaint();
         }
-    }
-    if let Some(err) = child.stderr.take() {
-        for line in BufReader::new(err).lines().map_while(Result::ok) {
-            let _ = tx.send(Msg::Log(line));
-            ctx.request_repaint();
+        match child.try_wait() {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(_) => break None,
         }
+    };
+    for r in readers {
+        let _ = r.join();
     }
-    child.wait().map(|s| s.success()).unwrap_or(false)
+    status.is_some_and(|s| s.success())
 }
