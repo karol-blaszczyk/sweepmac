@@ -16,7 +16,7 @@ pub fn header(
     ui: &mut egui::Ui,
     t: &Tokens,
     mark: Option<&egui::TextureHandle>,
-    last_scan: Option<&str>,
+    right_text: Option<&str>,
     busy: bool,
 ) -> HeaderResult {
     let mut rescan_clicked = false;
@@ -48,9 +48,9 @@ pub fn header(
             if busy {
                 resp.on_hover_text("A scan or cleanup is already running");
             }
-            if let Some(age) = last_scan {
+            if let Some(text) = right_text {
                 ui.add_space(2.0);
-                ui.label(style::meta(t, format!("Scanned {age}")));
+                ui.label(style::meta(t, text));
             }
         });
     });

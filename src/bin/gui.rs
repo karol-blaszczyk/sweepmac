@@ -14,20 +14,21 @@ mod ui;
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui::RichText;
 use sweepmac::{
     action_enabled, bulk_selectable_keys, clean_build_dir, clean_target, dir_size, disk_free,
-    docker_info, find_git_repos, find_node_modules, home, human, persist_pty_limit, progress_label,
-    pty_status, raise_pty_limit, remove_worktree, scan, summarize, target_by_id, DockerImage,
-    DockerInfo, DockerVolume, GitRepo, NodeModules, PtyLevel, PtyStatus, Risk, Selectable,
-    SelectionSummary, Worktree, WorktreeKind, ALL_CATEGORIES, DEFAULT_CLEAN_CATEGORIES,
+    docker_info_with, find_git_repos_with, find_node_modules_with, home, human, persist_pty_limit,
+    progress_label, pty_status, raise_pty_limit, remove_worktree, scan_with, summarize,
+    target_by_id, DockerImage, DockerInfo, DockerVolume, GitRepo, NodeModules, PtyLevel, PtyStatus,
+    Risk, Selectable, SelectionSummary, Worktree, WorktreeKind, ALL_CATEGORIES,
+    DEFAULT_CLEAN_CATEGORIES,
 };
 
 use ui::style::{self, Tokens};
@@ -184,6 +185,21 @@ enum Msg {
     DockerScanned(Option<DockerInfo>),
     NmScanned(Vec<NodeModules>),
     GitScanned(Vec<GitRepo>),
+    /// The cache scan is about to measure one target ("Measuring 7 of 34 …").
+    ScanProgress(String),
+    /// The node_modules walk entered a new directory.
+    NmProgress {
+        found: usize,
+        current: String,
+    },
+    /// The node_modules walk found one, streamed as soon as it's measured.
+    NmFound(NodeModules),
+    /// The git-repo walk entered a new directory.
+    GitProgress {
+        current: String,
+    },
+    /// The Docker scan is about to run one of its three queries.
+    DockerProgress(String),
     Log(String),
     /// About to start job `done` (0-indexed) of `total`.
     Progress {
@@ -222,12 +238,19 @@ struct App {
     pty: Option<PtyStatus>,
     docker: Option<DockerInfo>,
     docker_scanning: bool,
+    /// Which of the three Docker queries is currently running, e.g.
+    /// "querying Docker (docker images)…". Empty once the scan is done.
+    docker_progress: String,
     node_modules: Vec<NodeModules>,
     nm_scanning: bool,
+    /// "N found · ~/current/dir" while the node_modules walk is in flight.
+    nm_progress: String,
     /// Repositories found by the opt-in git scan. Empty until it is asked for —
     /// walking repos is a departure from the default promise.
     git_repos: Vec<GitRepo>,
     git_scanning: bool,
+    /// "walking ~/current/dir" while the git-repo walk is in flight.
+    git_progress: String,
     /// True once the user has asked for a repository scan in this session.
     git_requested: bool,
 
@@ -281,10 +304,13 @@ impl App {
             pty: None,
             docker: None,
             docker_scanning: false,
+            docker_progress: String::new(),
             node_modules: Vec::new(),
             nm_scanning: false,
+            nm_progress: String::new(),
             git_repos: Vec::new(),
             git_scanning: false,
+            git_progress: String::new(),
             git_requested: false,
             selected: HashSet::new(),
             vol_selected: HashSet::new(),
@@ -322,18 +348,30 @@ impl App {
         self.rx = Some(rx);
         let ctx = self.ctx.clone();
         thread::spawn(move || {
-            let rows = scan(ALL_CATEGORIES)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|r| Row {
-                    id: r.id,
-                    category: r.category,
-                    desc: r.desc,
-                    path: r.path,
-                    size: r.size,
-                })
-                .collect();
+            let progress_tx = tx.clone();
+            let progress_ctx = ctx.clone();
+            let rows = scan_with(ALL_CATEGORIES, &mut |done, total, desc| {
+                let _ = progress_tx.send(Msg::ScanProgress(progress_label(
+                    "Measuring",
+                    done,
+                    total,
+                    desc,
+                )));
+                progress_ctx.request_repaint();
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| Row {
+                id: r.id,
+                category: r.category,
+                desc: r.desc,
+                path: r.path,
+                size: r.size,
+            })
+            .collect();
             // Simulator size only; Docker is scanned separately (it is slow).
+            let _ = tx.send(Msg::ScanProgress("Measuring iOS simulators…".into()));
+            ctx.request_repaint();
             let sims = home()
                 .ok()
                 .map(|h| h.join("Library/Developer/CoreSimulator"))
@@ -352,22 +390,53 @@ impl App {
 
     fn start_docker_scan(&mut self) {
         self.docker_scanning = true;
+        self.docker_progress.clear();
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
         self.docker_rx = Some(rx);
         let ctx = self.ctx.clone();
         thread::spawn(move || {
-            let _ = tx.send(Msg::DockerScanned(docker_info()));
+            let progress_tx = tx.clone();
+            let progress_ctx = ctx.clone();
+            let info = docker_info_with(&mut |step| {
+                let _ = progress_tx.send(Msg::DockerProgress(format!("querying Docker ({step})…")));
+                progress_ctx.request_repaint();
+            });
+            let _ = tx.send(Msg::DockerScanned(info));
             ctx.request_repaint();
         });
     }
 
     fn start_nm_scan(&mut self) {
         self.nm_scanning = true;
+        self.nm_progress.clear();
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
         self.nm_rx = Some(rx);
         let ctx = self.ctx.clone();
         thread::spawn(move || {
-            let found = home().map(|h| find_node_modules(&h)).unwrap_or_default();
+            let dir_tx = tx.clone();
+            let dir_ctx = ctx.clone();
+            let found_count = std::cell::Cell::new(0usize);
+            let mut last = Instant::now() - Duration::from_secs(1);
+            let mut on_dir = |p: &Path| {
+                if last.elapsed() >= Duration::from_millis(80) {
+                    last = Instant::now();
+                    let _ = dir_tx.send(Msg::NmProgress {
+                        found: found_count.get(),
+                        current: short_home(p),
+                    });
+                    dir_ctx.request_repaint();
+                }
+            };
+            let found_tx = tx.clone();
+            let found_ctx = ctx.clone();
+            let mut on_found = |nm: &NodeModules| {
+                found_count.set(found_count.get() + 1);
+                let _ = found_tx.send(Msg::NmFound(nm.clone()));
+                found_ctx.request_repaint();
+            };
+            let found = home()
+                .map(|h| find_node_modules_with(&h, &mut on_dir, &mut on_found))
+                .unwrap_or_default();
             let _ = tx.send(Msg::NmScanned(found));
             ctx.request_repaint();
         });
@@ -378,11 +447,26 @@ impl App {
     fn start_git_scan(&mut self) {
         self.git_requested = true;
         self.git_scanning = true;
+        self.git_progress.clear();
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
         self.git_rx = Some(rx);
         let ctx = self.ctx.clone();
         thread::spawn(move || {
-            let found = home().map(|h| find_git_repos(&h)).unwrap_or_default();
+            let dir_tx = tx.clone();
+            let dir_ctx = ctx.clone();
+            let mut last = Instant::now() - Duration::from_secs(1);
+            let mut on_dir = |p: &Path| {
+                if last.elapsed() >= Duration::from_millis(80) {
+                    last = Instant::now();
+                    let _ = dir_tx.send(Msg::GitProgress {
+                        current: short_home(p),
+                    });
+                    dir_ctx.request_repaint();
+                }
+            };
+            let found = home()
+                .map(|h| find_git_repos_with(&h, &mut on_dir))
+                .unwrap_or_default();
             let _ = tx.send(Msg::GitScanned(found));
             ctx.request_repaint();
         });
@@ -965,6 +1049,11 @@ impl App {
                     self.status = progress_label("Cleaning", done, total, &label);
                     self.last_progress = Some(Instant::now());
                 }
+                Msg::ScanProgress(s) => {
+                    if self.phase == Phase::Scanning {
+                        self.status = s;
+                    }
+                }
                 Msg::Scanned {
                     rows,
                     sims,
@@ -1025,7 +1114,16 @@ impl App {
                     self.node_modules.retain(|n| n.path != path);
                     self.selected.remove(&nm_key(&path));
                 }
-                Msg::DockerScanned(_) | Msg::NmScanned(_) | Msg::GitScanned(_) => {}
+                // Handled by their own channel loops below — this batch only
+                // ever sees these via `rx`/`work_rx` if a variant is later
+                // wired to the wrong sender, so treat that case as a no-op.
+                Msg::DockerScanned(_)
+                | Msg::NmScanned(_)
+                | Msg::GitScanned(_)
+                | Msg::NmProgress { .. }
+                | Msg::NmFound(_)
+                | Msg::GitProgress { .. }
+                | Msg::DockerProgress(_) => {}
             }
         }
 
@@ -1036,10 +1134,25 @@ impl App {
             }
         }
         for msg in nm_batch {
-            if let Msg::NmScanned(found) = msg {
-                self.node_modules = found;
-                self.nm_scanning = false;
-                self.nm_rx = None;
+            match msg {
+                Msg::NmProgress { found, current } => {
+                    self.nm_progress = format!("{found} found · {current}");
+                }
+                Msg::NmFound(nm) => {
+                    if !self.node_modules.iter().any(|n| n.path == nm.path) {
+                        self.node_modules.push(nm);
+                        self.node_modules.sort_by_key(|n| std::cmp::Reverse(n.size));
+                    }
+                }
+                Msg::NmScanned(found) => {
+                    // Authoritative and already sorted — replaces the
+                    // incrementally-streamed rows above.
+                    self.node_modules = found;
+                    self.nm_scanning = false;
+                    self.nm_progress.clear();
+                    self.nm_rx = None;
+                }
+                _ => {}
             }
         }
 
@@ -1050,19 +1163,26 @@ impl App {
             }
         }
         for msg in git_batch {
-            if let Msg::GitScanned(found) = msg {
-                // Drop selections for build dirs that no longer exist.
-                let live: HashSet<String> = found
-                    .iter()
-                    .flat_map(|r| r.worktrees.iter())
-                    .flat_map(|w| w.build.iter())
-                    .map(|b| gitbuild_key(&b.path))
-                    .collect();
-                self.selected
-                    .retain(|k| !k.starts_with("gitbuild:") || live.contains(k));
-                self.git_repos = found;
-                self.git_scanning = false;
-                self.git_rx = None;
+            match msg {
+                Msg::GitProgress { current } => {
+                    self.git_progress = format!("walking {current}");
+                }
+                Msg::GitScanned(found) => {
+                    // Drop selections for build dirs that no longer exist.
+                    let live: HashSet<String> = found
+                        .iter()
+                        .flat_map(|r| r.worktrees.iter())
+                        .flat_map(|w| w.build.iter())
+                        .map(|b| gitbuild_key(&b.path))
+                        .collect();
+                    self.selected
+                        .retain(|k| !k.starts_with("gitbuild:") || live.contains(k));
+                    self.git_repos = found;
+                    self.git_scanning = false;
+                    self.git_progress.clear();
+                    self.git_rx = None;
+                }
+                _ => {}
             }
         }
 
@@ -1073,10 +1193,17 @@ impl App {
             }
         }
         for msg in docker_batch {
-            if let Msg::DockerScanned(info) = msg {
-                self.docker = info;
-                self.docker_scanning = false;
-                self.docker_rx = None;
+            match msg {
+                Msg::DockerProgress(s) => {
+                    self.docker_progress = s;
+                }
+                Msg::DockerScanned(info) => {
+                    self.docker = info;
+                    self.docker_scanning = false;
+                    self.docker_progress.clear();
+                    self.docker_rx = None;
+                }
+                _ => {}
             }
         }
     }
@@ -1122,6 +1249,17 @@ fn gitbuild_key(p: &std::path::Path) -> String {
 }
 fn vol_key(name: &str) -> String {
     format!("vol:{name}")
+}
+
+/// Display path for a progress line, shortened to `~/…` under the home
+/// directory. A local echo of the library's private `short_label`: it isn't
+/// exported, and this is small enough not to be worth widening its API for.
+fn short_home(p: &Path) -> String {
+    home()
+        .ok()
+        .and_then(|h| p.strip_prefix(&h).ok())
+        .map(|rel| format!("~/{}", rel.display()))
+        .unwrap_or_else(|| p.display().to_string())
 }
 
 /// The Docker prune categories shown in Advanced, with their reclaimable size.
@@ -1182,12 +1320,16 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(style::GUTTER, style::PANEL_PAD_Y)),
             )
             .show(ctx, |ui| {
-                let age = self.last_scan_age();
+                let right_text = if self.phase == Phase::Scanning {
+                    Some(self.status.clone())
+                } else {
+                    self.last_scan_age().map(|a| format!("Scanned {a}"))
+                };
                 let res = w::header(
                     ui,
                     &t,
                     self.mark.as_ref(),
-                    age.as_deref(),
+                    right_text.as_deref(),
                     self.phase != Phase::Idle,
                 );
                 if res.rescan_clicked {
@@ -1241,7 +1383,11 @@ impl App {
             .show(ctx, |ui| {
                 if self.phase == Phase::Scanning && self.rows.is_empty() {
                     ui.centered_and_justified(|ui| {
-                        ui.add(egui::Spinner::new().size(26.0).color(t.text_muted));
+                        ui.vertical_centered(|ui| {
+                            ui.add(egui::Spinner::new().size(26.0).color(t.text_muted));
+                            ui.add_space(8.0);
+                            ui.label(style::meta(&t, &self.status));
+                        });
                     });
                     return;
                 }
@@ -1567,7 +1713,12 @@ impl App {
                     ui.horizontal(|ui| {
                         if self.docker_scanning {
                             ui.add(egui::Spinner::new().size(12.0).color(t.text_muted));
-                            ui.label(style::meta(&t, "querying Docker (docker system df)…"));
+                            let msg: &str = if self.docker_progress.is_empty() {
+                                "querying Docker (docker system df)…"
+                            } else {
+                                &self.docker_progress
+                            };
+                            ui.label(style::meta(&t, msg));
                         } else {
                             ui.label(style::meta(&t, "Docker is not reachable — skipped."));
                         }
@@ -1722,14 +1873,16 @@ impl App {
                 });
                 ui.add_space(4.0);
                 if self.node_modules.is_empty() {
-                    ui.label(style::meta(
-                        &t,
-                        if self.nm_scanning {
+                    let msg: &str = if self.nm_scanning {
+                        if self.nm_progress.is_empty() {
                             "looking for node_modules folders…"
                         } else {
-                            "none found"
-                        },
-                    ));
+                            &self.nm_progress
+                        }
+                    } else {
+                        "none found"
+                    };
+                    ui.label(style::meta(&t, msg));
                 } else {
                     for (n, nm) in self.node_modules.iter().take(12).enumerate() {
                         if n > 0 {
@@ -1867,14 +2020,16 @@ impl App {
                 ui.add_space(8.0);
 
                 if self.git_repos.is_empty() {
-                    ui.label(style::meta(
-                        &t,
-                        if self.git_scanning {
+                    let msg: &str = if self.git_scanning {
+                        if self.git_progress.is_empty() {
                             "walking your repositories…"
                         } else {
-                            "no git repositories found"
-                        },
-                    ));
+                            &self.git_progress
+                        }
+                    } else {
+                        "no git repositories found"
+                    };
+                    ui.label(style::meta(&t, msg));
                     return;
                 }
 

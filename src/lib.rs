@@ -325,22 +325,35 @@ pub fn home() -> io::Result<PathBuf> {
 
 /// Measure every target whose category is in `categories`.
 pub fn scan(categories: &[&str]) -> io::Result<Vec<ScanRow>> {
+    scan_with(categories, &mut |_, _, _| {})
+}
+
+/// Same as [`scan`], calling `on_progress(done, total, desc)` before each
+/// target is measured — the measurement itself (`dir_size`) can take a while
+/// on a near-full disk, so a caller can show which one is in flight.
+pub fn scan_with(
+    categories: &[&str],
+    on_progress: &mut dyn FnMut(usize, usize, &str),
+) -> io::Result<Vec<ScanRow>> {
     let home = home()?;
-    let mut rows: Vec<ScanRow> = TARGETS
+    let targets: Vec<&Target> = TARGETS
         .iter()
         .filter(|t| categories.contains(&t.category))
-        .map(|t| {
-            let path = home.join(t.rel);
-            let size = if path.exists() { dir_size(&path) } else { 0 };
-            ScanRow {
-                id: t.id,
-                category: t.category,
-                desc: t.desc,
-                path,
-                size,
-            }
-        })
         .collect();
+    let total = targets.len();
+    let mut rows = Vec::with_capacity(total);
+    for (done, t) in targets.into_iter().enumerate() {
+        on_progress(done, total, t.desc);
+        let path = home.join(t.rel);
+        let size = if path.exists() { dir_size(&path) } else { 0 };
+        rows.push(ScanRow {
+            id: t.id,
+            category: t.category,
+            desc: t.desc,
+            path,
+            size,
+        });
+    }
     rows.sort_by_key(|r| std::cmp::Reverse(r.size));
     Ok(rows)
 }
@@ -455,6 +468,7 @@ pub fn progress_label(verb: &str, done: usize, total: usize, current: &str) -> S
 }
 
 /// A discovered `node_modules` directory.
+#[derive(Clone)]
 pub struct NodeModules {
     pub path: PathBuf,
     /// Display path, shortened to `~/…` when under the home directory.
@@ -479,14 +493,33 @@ const NM_SKIP: &[&str] = &[
 /// counted once, in their parent's total), skips symlinks, and skips dotdirs
 /// other than `.next` (Next.js standalone output keeps a real `node_modules`).
 pub fn find_node_modules(root: &Path) -> Vec<NodeModules> {
+    find_node_modules_with(root, &mut |_| {}, &mut |_| {})
+}
+
+/// Same as [`find_node_modules`], calling `on_dir` for every directory
+/// entered and `on_found` immediately after each `node_modules` is measured —
+/// the walk can take a long time on a large home directory, so a caller can
+/// show which directory is being visited and stream results as they appear.
+pub fn find_node_modules_with(
+    root: &Path,
+    on_dir: &mut dyn FnMut(&Path),
+    on_found: &mut dyn FnMut(&NodeModules),
+) -> Vec<NodeModules> {
     let home = home().ok();
     let mut out = Vec::new();
-    walk_node_modules(root, &home, &mut out);
+    walk_node_modules(root, &home, &mut out, on_dir, on_found);
     out.sort_by_key(|n| std::cmp::Reverse(n.size));
     out
 }
 
-fn walk_node_modules(dir: &Path, home: &Option<PathBuf>, out: &mut Vec<NodeModules>) {
+fn walk_node_modules(
+    dir: &Path,
+    home: &Option<PathBuf>,
+    out: &mut Vec<NodeModules>,
+    on_dir: &mut dyn FnMut(&Path),
+    on_found: &mut dyn FnMut(&NodeModules),
+) {
+    on_dir(dir);
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -502,7 +535,9 @@ fn walk_node_modules(dir: &Path, home: &Option<PathBuf>, out: &mut Vec<NodeModul
             let path = entry.path();
             let size = dir_size(&path);
             let label = short_label(&path, home);
-            out.push(NodeModules { path, label, size });
+            let nm = NodeModules { path, label, size };
+            on_found(&nm);
+            out.push(nm);
             continue; // prune: don't descend into deps
         }
 
@@ -513,7 +548,7 @@ fn walk_node_modules(dir: &Path, home: &Option<PathBuf>, out: &mut Vec<NodeModul
         if name.starts_with('.') && name != ".next" {
             continue;
         }
-        walk_node_modules(&entry.path(), home, out);
+        walk_node_modules(&entry.path(), home, out, on_dir, on_found);
     }
 }
 
@@ -744,13 +779,20 @@ impl GitRepo {
 /// Read-only: no git command run here can take the index lock, and nothing is
 /// written. Returns an empty list when git isn't available.
 pub fn find_git_repos(root: &Path) -> Vec<GitRepo> {
+    find_git_repos_with(root, &mut |_| {})
+}
+
+/// Same as [`find_git_repos`], calling `on_dir` for every directory entered —
+/// walking every repository under `$HOME` can take a while, so a caller can
+/// show which directory is being visited.
+pub fn find_git_repos_with(root: &Path, on_dir: &mut dyn FnMut(&Path)) -> Vec<GitRepo> {
     if !git_available() {
         return Vec::new();
     }
     let home = home().ok();
     let mut seen: Vec<PathBuf> = Vec::new();
     let mut out: Vec<GitRepo> = Vec::new();
-    walk_git_repos(root, &home, &mut seen, &mut out);
+    walk_git_repos(root, &home, &mut seen, &mut out, on_dir);
     out.sort_by_key(|r| std::cmp::Reverse(r.build_bytes() + r.safe_worktree_bytes()));
     out
 }
@@ -760,7 +802,9 @@ fn walk_git_repos(
     home: &Option<PathBuf>,
     seen: &mut Vec<PathBuf>,
     out: &mut Vec<GitRepo>,
+    on_dir: &mut dyn FnMut(&Path),
 ) {
+    on_dir(dir);
     // A `.git` entry means a worktree — of this repo, or a linked one. Either
     // way `git worktree list` gives us the whole set, so the walk stops here
     // (which also means submodules are folded into their parent's tree size).
@@ -786,7 +830,7 @@ fn walk_git_repos(
         if name.starts_with('.') && !GIT_DOT_ALLOW.iter().any(|s| *s == name) {
             continue;
         }
-        walk_git_repos(&entry.path(), home, seen, out);
+        walk_git_repos(&entry.path(), home, seen, out, on_dir);
     }
 }
 
@@ -1403,6 +1447,14 @@ impl DockerInfo {
 /// Gather a granular Docker breakdown (per-type reclaimable + per-volume).
 /// `None` if Docker isn't reachable.
 pub fn docker_info() -> Option<DockerInfo> {
+    docker_info_with(&mut |_| {})
+}
+
+/// Same as [`docker_info`], calling `on_step` before each of its three Docker
+/// invocations — colima can be slow to answer, so a caller can show which
+/// query is currently in flight.
+pub fn docker_info_with(on_step: &mut dyn FnMut(&str)) -> Option<DockerInfo> {
+    on_step("docker system df");
     let df = docker_cmd()
         .args(["system", "df", "--format", "{{.Type}}\t{{.Reclaimable}}"])
         .output()
@@ -1425,7 +1477,9 @@ pub fn docker_info() -> Option<DockerInfo> {
             _ => {}
         }
     }
+    on_step("docker volume ls");
     info.volumes = docker_volumes();
+    on_step("docker images");
     info.image_list = docker_images();
     Some(info)
 }
@@ -2098,6 +2152,41 @@ mod tests {
         };
         let missing = env::temp_dir().join("sweepmac-test-definitely-missing");
         assert!(clean_target(&t, &missing).is_ok());
+    }
+
+    #[test]
+    fn scan_with_reports_progress_for_every_target_in_the_category() {
+        let mut seen: Vec<(usize, usize, String)> = Vec::new();
+        let rows = scan_with(&["system"], &mut |done, total, desc| {
+            seen.push((done, total, desc.to_string()));
+        })
+        .unwrap();
+        let expected_total = TARGETS.iter().filter(|t| t.category == "system").count();
+        assert_eq!(rows.len(), expected_total);
+        assert_eq!(seen.len(), expected_total);
+        for (i, (done, total, _)) in seen.iter().enumerate() {
+            assert_eq!(*done, i);
+            assert_eq!(*total, expected_total);
+        }
+    }
+
+    #[test]
+    fn find_node_modules_with_streams_dirs_and_finds() {
+        let root = scratch_dir("nm-with");
+        fs::create_dir_all(root.join("proj/node_modules")).unwrap();
+        fs::write(root.join("proj/node_modules/x.txt"), "x").unwrap();
+
+        let mut dirs_seen = 0usize;
+        let mut found: Vec<PathBuf> = Vec::new();
+        let out = find_node_modules_with(&root, &mut |_| dirs_seen += 1, &mut |nm| {
+            found.push(nm.path.clone())
+        });
+
+        assert!(dirs_seen >= 2, "should visit root and proj at least");
+        assert_eq!(found.len(), 1);
+        assert!(found[0].ends_with("node_modules"));
+        assert_eq!(out.len(), 1);
+        fs::remove_dir_all(&root).unwrap();
     }
 
     // --- selection model -------------------------------------------------
