@@ -449,6 +449,11 @@ pub fn action_enabled(summary: SelectionSummary, busy: bool) -> bool {
     !summary.is_empty() && !busy
 }
 
+/// "Cleaning 3 of 8 · Xcode DerivedData"
+pub fn progress_label(verb: &str, done: usize, total: usize, current: &str) -> String {
+    format!("{verb} {} of {total} · {current}", done + 1)
+}
+
 /// A discovered `node_modules` directory.
 pub struct NodeModules {
     pub path: PathBuf,
@@ -2179,6 +2184,11 @@ mod tests {
         assert!(!action_enabled(empty, true));
         assert!(!action_enabled(some, true), "busy cleaning");
         assert!(action_enabled(some, false));
+    }
+
+    #[test]
+    fn progress_label_is_one_indexed_for_people() {
+        assert_eq!(progress_label("Cleaning", 2, 8, "X"), "Cleaning 3 of 8 · X");
     }
 
     // --- tray/app glyph --------------------------------------------------

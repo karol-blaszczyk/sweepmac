@@ -24,10 +24,10 @@ use eframe::egui;
 use egui::RichText;
 use sweepmac::{
     action_enabled, bulk_selectable_keys, clean_build_dir, clean_target, dir_size, disk_free,
-    docker_info, find_git_repos, find_node_modules, home, human, persist_pty_limit, pty_status,
-    raise_pty_limit, remove_worktree, scan, summarize, target_by_id, DockerImage, DockerInfo,
-    DockerVolume, GitRepo, NodeModules, PtyLevel, PtyStatus, Risk, Selectable, SelectionSummary,
-    Worktree, WorktreeKind, ALL_CATEGORIES, DEFAULT_CLEAN_CATEGORIES,
+    docker_info, find_git_repos, find_node_modules, home, human, persist_pty_limit, progress_label,
+    pty_status, raise_pty_limit, remove_worktree, scan, summarize, target_by_id, DockerImage,
+    DockerInfo, DockerVolume, GitRepo, NodeModules, PtyLevel, PtyStatus, Risk, Selectable,
+    SelectionSummary, Worktree, WorktreeKind, ALL_CATEGORIES, DEFAULT_CLEAN_CATEGORIES,
 };
 
 use ui::style::{self, Tokens};
@@ -185,6 +185,12 @@ enum Msg {
     NmScanned(Vec<NodeModules>),
     GitScanned(Vec<GitRepo>),
     Log(String),
+    /// About to start job `done` (0-indexed) of `total`.
+    Progress {
+        done: usize,
+        total: usize,
+        label: String,
+    },
     /// A batch finished: what it freed and whether every job succeeded.
     Done {
         freed: u64,
@@ -245,6 +251,9 @@ struct App {
     log: Vec<String>,
     status: String,
     started: Option<Instant>,
+    /// When the current job last reported activity (a new item or a log
+    /// line) — drives the "still on this item" stall hint.
+    last_progress: Option<Instant>,
     last_scan: Option<Instant>,
 
     /// Scan-result channel (Msg::Scanned only).
@@ -290,6 +299,7 @@ impl App {
             log: Vec::new(),
             status: String::new(),
             started: None,
+            last_progress: None,
             last_scan: None,
             rx: None,
             work_rx: None,
@@ -598,6 +608,7 @@ impl App {
         self.phase = Phase::Working;
         self.log.clear();
         self.started = Some(Instant::now());
+        self.last_progress = Some(Instant::now());
         self.activity_open = true;
         self.status = format!("Cleaning {} item{}…", jobs.len(), w::plural(jobs.len()));
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
@@ -607,7 +618,13 @@ impl App {
             let mut freed = 0u64;
             let mut failures = 0usize;
             let count = jobs.len();
-            for job in jobs {
+            for (i, job) in jobs.into_iter().enumerate() {
+                let _ = tx.send(Msg::Progress {
+                    done: i,
+                    total: count,
+                    label: job.label(),
+                });
+                ctx.request_repaint();
                 match job {
                     Job::Cache {
                         id,
@@ -718,6 +735,7 @@ impl App {
         self.phase = Phase::Working;
         self.log.clear();
         self.started = Some(Instant::now());
+        self.last_progress = Some(Instant::now());
         self.activity_open = true;
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
         self.work_rx = Some(rx);
@@ -756,6 +774,7 @@ impl App {
         self.phase = Phase::Working;
         self.log.clear();
         self.started = Some(Instant::now());
+        self.last_progress = Some(Instant::now());
         self.activity_open = true;
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
         self.work_rx = Some(rx);
@@ -800,6 +819,7 @@ impl App {
         self.phase = Phase::Working;
         self.log.clear();
         self.started = Some(Instant::now());
+        self.last_progress = Some(Instant::now());
         self.activity_open = true;
         self.status = format!("Removing {}…", r.wt.label);
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
@@ -834,6 +854,7 @@ impl App {
         self.phase = Phase::Working;
         self.log.clear();
         self.started = Some(Instant::now());
+        self.last_progress = Some(Instant::now());
         self.activity_open = true;
         self.status = "Waiting for your admin password…".into();
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = std::sync::mpsc::channel();
@@ -878,6 +899,18 @@ impl App {
 
     fn elapsed_secs(&self) -> u64 {
         self.started.map(|t| t.elapsed().as_secs()).unwrap_or(0)
+    }
+
+    /// A reassurance line once one item has held the spinner a while, so a
+    /// slow (not hung) operation doesn't read as stuck.
+    fn stall_hint(&self) -> Option<String> {
+        if self.phase != Phase::Working {
+            return None;
+        }
+        let secs = self.last_progress?.elapsed().as_secs();
+        (secs > 60).then(|| {
+            format!("still on this item for {secs}s — large caches can take several minutes")
+        })
     }
 
     /// Human age of the last completed scan, e.g. "just now", "4 min ago".
@@ -926,6 +959,11 @@ impl App {
                     if overflow > 0 {
                         self.log.drain(0..overflow);
                     }
+                    self.last_progress = Some(Instant::now());
+                }
+                Msg::Progress { done, total, label } => {
+                    self.status = progress_label("Cleaning", done, total, &label);
+                    self.last_progress = Some(Instant::now());
                 }
                 Msg::Scanned {
                     rows,
@@ -960,6 +998,7 @@ impl App {
                 } => {
                     self.phase = Phase::Idle;
                     self.started = None;
+                    self.last_progress = None;
                     self.vol_selected.clear();
                     self.img_selected.clear();
                     self.danger_ack = false;
@@ -1180,7 +1219,10 @@ impl App {
             .show(ctx, |ui| {
                 let summary = self.summary();
                 let busy = self.phase == Phase::Working;
-                let busy_label = busy.then(|| self.status.clone());
+                let busy_label = busy.then(|| match self.stall_hint() {
+                    Some(hint) => format!("{} · {hint}", self.status),
+                    None => self.status.clone(),
+                });
                 let enabled = action_enabled(summary, busy);
                 if w::action_bar(ui, &t, summary, enabled, busy_label.as_deref()) {
                     self.review = self.build_review();
