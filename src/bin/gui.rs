@@ -796,16 +796,47 @@ impl App {
                         }
                     }
                     Job::Simulators => {
-                        let _ = tx.send(Msg::Log("$ xcrun simctl delete unavailable".into()));
-                        ctx.request_repaint();
-                        if !stream(
-                            &tx,
-                            &ctx,
-                            &cancel,
-                            "xcrun",
-                            &["simctl", "delete", "unavailable"],
-                        ) {
-                            failures += 1;
+                        // `delete unavailable` only removes devices whose
+                        // runtime was itself deleted (an Xcode/runtime
+                        // update) — it exits 0 with no output whether or not
+                        // there was anything to do, so without this check a
+                        // machine with none looks identical to a failure.
+                        match sweepmac::simctl_unavailable_count() {
+                            Some(0) => {
+                                let _ = tx.send(Msg::Log(
+                                    "no unavailable simulators to remove — only devices \
+                                     orphaned by a removed Xcode/runtime qualify; the rest \
+                                     of this folder is real, available device data"
+                                        .into(),
+                                ));
+                            }
+                            Some(n) => {
+                                let _ = tx.send(Msg::Log(format!(
+                                    "$ xcrun simctl delete unavailable ({n} unavailable device{})",
+                                    w::plural(n)
+                                )));
+                                ctx.request_repaint();
+                                if stream(
+                                    &tx,
+                                    &ctx,
+                                    &cancel,
+                                    "xcrun",
+                                    &["simctl", "delete", "unavailable"],
+                                ) {
+                                    let _ = tx.send(Msg::Log(format!(
+                                        "  removed {n} unavailable device{}",
+                                        w::plural(n)
+                                    )));
+                                } else {
+                                    failures += 1;
+                                }
+                            }
+                            None => {
+                                failures += 1;
+                                let _ = tx.send(Msg::Log(
+                                    "could not query simctl for unavailable devices".into(),
+                                ));
+                            }
                         }
                     }
                 }

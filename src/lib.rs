@@ -1406,7 +1406,7 @@ pub fn extras() -> Vec<(&'static str, PathBuf, u64)> {
         }
     }
 
-    // iOS simulators: real on-disk size of unavailable-device clutter.
+    // iOS simulators: whole-folder size — see the caveat on `simctl_unavailable_count`.
     let sims = home.join("Library/Developer/CoreSimulator");
     if sims.exists() {
         let s = dir_size(&sims);
@@ -1415,6 +1415,27 @@ pub fn extras() -> Vec<(&'static str, PathBuf, u64)> {
         }
     }
     out
+}
+
+/// How many "unavailable" Simulator devices `xcrun simctl delete unavailable`
+/// would remove — orphaned device records left behind when the runtime they
+/// depended on was deleted (e.g. by an Xcode/runtime update). A device that
+/// is merely shut down or unused is NOT unavailable and this will not touch
+/// it, so on a machine with no orphaned devices this is legitimately 0 and
+/// the command is a real, silent no-op — not a failure. `None` if `simctl`
+/// couldn't be queried.
+pub fn simctl_unavailable_count() -> Option<usize> {
+    let out = output_with_timeout(
+        Command::new("xcrun").args(["simctl", "list", "devices", "unavailable", "-j"]),
+        Duration::from_secs(10),
+    )?;
+    if !out.status.success() {
+        return None;
+    }
+    // No JSON dependency: each device object has exactly one "udid" field,
+    // so counting occurrences of the key is a reliable device count.
+    let text = String::from_utf8_lossy(&out.stdout);
+    Some(text.matches("\"udid\"").count())
 }
 
 /// How much `docker builder/image prune -af` would reclaim inside the VM, in
@@ -2262,6 +2283,13 @@ mod tests {
         let mut cmd = Command::new("true");
         let out = output_with_timeout(&mut cmd, Duration::from_secs(5));
         assert!(out.is_some_and(|o| o.status.success()));
+    }
+
+    #[test]
+    fn simctl_unavailable_count_queries_without_hanging() {
+        // The actual count is environment-dependent (0 on a machine with no
+        // orphaned devices) — this just proves the query itself succeeds.
+        assert!(simctl_unavailable_count().is_some());
     }
 
     // --- selection model -------------------------------------------------
