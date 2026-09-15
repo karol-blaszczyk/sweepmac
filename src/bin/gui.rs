@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -760,8 +760,12 @@ impl App {
                         };
                         let _ = tx.send(Msg::Log(format!("$ docker {} — {label}", args.join(" "))));
                         ctx.request_repaint();
-                        if !stream(&tx, &ctx, &cancel, sweepmac::docker_bin(), args) {
+                        let (ok, lines) =
+                            stream_capture(&tx, &ctx, &cancel, sweepmac::docker_bin(), args);
+                        if !ok {
                             failures += 1;
+                        } else if reclaimed_nothing(&lines) {
+                            let _ = tx.send(Msg::Log(format!("  {}", nothing_pruned(kind))));
                         }
                     }
                     Job::NodeModules { label, path, size } => {
@@ -1295,6 +1299,8 @@ struct Effects {
     vol_toggles: Vec<String>,
     img_toggles: Vec<String>,
     img_set_all: Option<bool>,
+    /// `Some(select)` when the git section's select-all was clicked.
+    git_set_all: Option<bool>,
     request_images: bool,
     request_volumes: bool,
     /// `Some(persist)` when a pty action was clicked.
@@ -1343,8 +1349,10 @@ fn short_home(p: &Path) -> String {
 fn docker_prune_kinds(d: &DockerInfo) -> Vec<(&'static str, &'static str, u64)> {
     vec![
         ("builder", "Build cache", d.build_cache),
-        ("image", "Unused images", d.images),
+        // Containers before images: a stopped container still references its
+        // image, so `image prune` can free nothing until the container is gone.
         ("container", "Stopped containers", d.containers),
+        ("image", "Unused images", d.images),
         ("network", "Unused networks", 0),
     ]
 }
@@ -1535,6 +1543,22 @@ impl App {
                 for id in std::mem::take(&mut fx.img_toggles) {
                     if !self.img_selected.remove(&id) {
                         self.img_selected.insert(id);
+                    }
+                }
+                if let Some(all) = fx.git_set_all {
+                    // Build dirs only. Worktree removal is individual opt-in
+                    // and is never swept in by a bulk selection.
+                    let keys: Vec<String> = self
+                        .worktrees()
+                        .flat_map(|w| w.build.iter())
+                        .map(|b| gitbuild_key(&b.path))
+                        .collect();
+                    for k in keys {
+                        if all {
+                            self.selected.insert(k);
+                        } else {
+                            self.selected.remove(&k);
+                        }
                     }
                 }
                 if let Some(all) = fx.img_set_all {
@@ -2104,6 +2128,25 @@ impl App {
                             ui.add(egui::Spinner::new().size(12.0).color(t.text_muted));
                         } else if ui.add(style::quiet_button(&t, "Rescan")).clicked() {
                             fx.rescan_git = true;
+                        }
+                        // One click for the whole section: every build dir here
+                        // is regenerable, and ticking 180 of them by hand is the
+                        // slowest thing in the app.
+                        let builds: Vec<String> = self
+                            .worktrees()
+                            .flat_map(|w| w.build.iter())
+                            .map(|b| gitbuild_key(&b.path))
+                            .collect();
+                        if !builds.is_empty() {
+                            let all = builds.iter().all(|k| self.selected.contains(k));
+                            let lbl = if all {
+                                "Select no build dirs".to_string()
+                            } else {
+                                format!("Select all {} build dirs", builds.len())
+                            };
+                            if ui.add(style::quiet_button(&t, &lbl)).clicked() {
+                                fx.git_set_all = Some(!all);
+                            }
                         }
                     });
                 });
@@ -2769,6 +2812,18 @@ fn stream(
     prog: &str,
     args: &[&str],
 ) -> bool {
+    stream_capture(tx, ctx, cancel, prog, args).0
+}
+
+/// Like [`stream`], but also returns the lines it logged, so the caller can act
+/// on what the command said (see `reclaimed_nothing`).
+fn stream_capture(
+    tx: &Sender<Msg>,
+    ctx: &egui::Context,
+    cancel: &AtomicBool,
+    prog: &str,
+    args: &[&str],
+) -> (bool, Vec<String>) {
     let mut child = match Command::new(prog)
         .args(args)
         .stdout(Stdio::piped())
@@ -2779,7 +2834,7 @@ fn stream(
         Err(e) => {
             let _ = tx.send(Msg::Log(format!("could not run {prog}: {e}")));
             ctx.request_repaint();
-            return false;
+            return (false, Vec::new());
         }
     };
     let pipes: Vec<Box<dyn Read + Send>> = [
@@ -2795,13 +2850,18 @@ fn stream(
     .into_iter()
     .flatten()
     .collect();
+    let out = Arc::new(Mutex::new(Vec::new()));
     let readers: Vec<thread::JoinHandle<()>> = pipes
         .into_iter()
         .map(|pipe| {
             let tx = tx.clone();
             let ctx = ctx.clone();
+            let out = Arc::clone(&out);
             thread::spawn(move || {
                 for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                    if let Ok(mut o) = out.lock() {
+                        o.push(line.clone());
+                    }
                     let _ = tx.send(Msg::Log(line));
                     ctx.request_repaint();
                 }
@@ -2825,5 +2885,55 @@ fn stream(
     for r in readers {
         let _ = r.join();
     }
-    status.is_some_and(|s| s.success())
+    let lines = out.lock().map(|o| o.clone()).unwrap_or_default();
+    (status.is_some_and(|s| s.success()), lines)
+}
+
+/// True when a `docker ... prune` run ended with "Total reclaimed space: 0B",
+/// i.e. it exited cleanly having removed nothing.
+fn reclaimed_nothing(lines: &[String]) -> bool {
+    lines
+        .iter()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix("Total reclaimed space:"))
+        .is_some_and(|rest| {
+            let v = rest.trim();
+            v == "0" || v.starts_with("0B") || v.starts_with("0 B")
+        })
+}
+
+/// Why a prune of `kind` can come back empty. The image case is the one that
+/// surprises people: `docker system df` counts an image as reclaimable while a
+/// *stopped* container still pins it, and `image prune` will not touch it.
+fn nothing_pruned(kind: &str) -> &'static str {
+    match kind {
+        "image" => {
+            "nothing removed — every image is still referenced by a container, \
+                    and stopped containers count. Clean \"Stopped containers\" first, \
+                    then re-scan."
+        }
+        "builder" => "nothing removed — the build cache is already empty.",
+        "container" => "nothing removed — no stopped containers.",
+        "network" => "nothing removed — no unused networks.",
+        _ => "nothing removed.",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_reclaim_is_detected() {
+        let lines = vec![
+            "Deleted Images:".to_string(),
+            "Total reclaimed space: 0B".to_string(),
+        ];
+        assert!(reclaimed_nothing(&lines));
+        assert!(!reclaimed_nothing(&[
+            "Total reclaimed space: 2.9GB".to_string()
+        ]));
+        // No prune summary at all: nothing to report on.
+        assert!(!reclaimed_nothing(&["some other output".to_string()]));
+    }
 }
