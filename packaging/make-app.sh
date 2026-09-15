@@ -19,6 +19,10 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$ICONSET"
 cp target/release/sweepmac target/release/sweepmac-gui target/release/sweepmac-tray \
     "$APP/Contents/MacOS/"
 cp packaging/Info.plist "$APP/Contents/Info.plist"
+# Stamp the bundle version from Cargo.toml so the plist cannot drift.
+VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" \
+    -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist" >/dev/null
 
 echo "==> generating icon"
 target/release/sweepmac-iconfile "$BASE_PNG" 1024
