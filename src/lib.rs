@@ -2287,9 +2287,13 @@ mod tests {
 
     #[test]
     fn simctl_unavailable_count_queries_without_hanging() {
-        // The actual count is environment-dependent (0 on a machine with no
-        // orphaned devices) — this just proves the query itself succeeds.
-        assert!(simctl_unavailable_count().is_some());
+        // Both the count and the availability of `xcrun simctl` are
+        // environment-dependent — a CI runner without usable simulator tooling
+        // returns None, and that is not a failure. What this guards is the
+        // deadline: the query must come back rather than stall a scan.
+        let started = std::time::Instant::now();
+        let _ = simctl_unavailable_count();
+        assert!(started.elapsed() < Duration::from_secs(20));
     }
 
     // --- selection model -------------------------------------------------
