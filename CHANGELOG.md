@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.3.1 — 2026-09-18
+
+- Fixed `docker_prune_kinds()` running "Unused images" before "Stopped
+  containers" — a stopped container still references its image, so
+  `docker image prune -af` reclaimed nothing while the panel advertised what
+  `docker system df` called reclaimable. Containers now prune first.
+  - A prune that ends with `Total reclaimed space: 0B` now logs why instead
+    of reporting silent success.
+- Git worktrees section gained a one-click "Select all N build dirs" /
+  "Select no build dirs" toggle in the section header, for repos with many
+  stale worktrees. Build dirs only — removing a worktree stays individual
+  opt-in and is never part of a bulk selection.
+- `packaging/make-app.sh` now stamps `CFBundleVersion` /
+  `CFBundleShortVersionString` from `Cargo.toml` instead of the hardcoded
+  value in `packaging/Info.plist`, so the bundled app's reported version
+  can't drift from the crate version again.
+- Added a Homebrew **cask** (`Casks/sweepmac.rb`): `brew install --cask
+  sweepmac` installs the packaged `sweepmac.app` into `/Applications` (the
+  release DMG) and links the bundled CLI/GUI onto `PATH`, alongside the
+  existing formula which builds binaries only, from source.
+
 ## v0.3.0 — 2026-09-09
 
 - New opt-in `git` category: finds git worktrees under a root (agents park
