@@ -7,7 +7,7 @@
     <key>CFBundleDisplayName</key>
     <string>sweepmac</string>
     <key>CFBundleIdentifier</key>
-    <string>ai.sekondbrain.sweepmac</string>
+    <string>dev.sweepmac.sweepmac</string>
     <key>CFBundleVersion</key>
     <string>0.3.0</string>
     <key>CFBundleShortVersionString</key>

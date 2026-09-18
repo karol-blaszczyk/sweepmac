@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.2 — 2026-09-18
+
+- Renamed the app bundle identifier from `ai.sekondbrain.sweepmac` to
+  `dev.sweepmac.sweepmac`. sweepmac is a public, personal project — it
+  shouldn't carry an org identifier that has nothing to do with it. Not
+  user-visible (no persisted preferences use it) and needs no migration; the
+  cask's `zap` also trashes any leftover file under the old id.
+
 ## v0.3.1 — 2026-09-18
 
 - Fixed `docker_prune_kinds()` running "Unused images" before "Stopped
