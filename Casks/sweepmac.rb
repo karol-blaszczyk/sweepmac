@@ -1,6 +1,6 @@
 cask "sweepmac" do
-  version "0.3.1"
-  sha256 "8b6ad2eb5f10e5ea09bcfc7b19bcc3625d5da8e2d05c0aa72c701e7d59ac49b6"
+  version "0.3.2"
+  sha256 "6d80f9d5765477a56a49bf3cc9aaf6e529e700fb049a94e162b73529e11706c6"
 
   url "https://github.com/karol-blaszczyk/sweepmac/releases/download/v#{version}/sweepmac.dmg",
       verified: "github.com/karol-blaszczyk/sweepmac/"
