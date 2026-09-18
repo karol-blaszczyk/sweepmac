@@ -21,8 +21,12 @@ class Sweepmac < Formula
       Three binaries were installed:
         sweepmac        CLI  — scan is the default, nothing is deleted without --clean
         sweepmac-gui    native window with per-category checkboxes
-        sweepmac-tray   🧹 menu-bar app (run from a terminal it also shows a Dock icon;
-                        see the README for wrapping it in a .app to hide that)
+        sweepmac-tray   🧹 menu-bar app (run from a terminal it also shows a Dock icon)
+
+      For the packaged menu-bar app in /Applications — no Dock icon, launches at
+      login like any other app — install the cask instead:
+
+        brew install --cask sweepmac
     EOS
   end
 

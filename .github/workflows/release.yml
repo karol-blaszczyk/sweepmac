@@ -5,7 +5,7 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
-# Needed to create the GitHub Release and attach the DMG.
+# Needed to create the GitHub Release, attach the DMG, and push the cask bump.
 permissions:
   contents: write
 
@@ -28,3 +28,33 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/sweepmac.dmg
+
+      # The cask points at the DMG this job just published, so it has to be
+      # bumped here — a hand-edited checksum is a cask that installs nothing.
+      - name: Bump the Homebrew cask and formula to this release
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          SHA="$(shasum -a 256 dist/sweepmac.dmg | cut -d' ' -f1)"
+          git fetch origin main
+          git checkout main
+          # The cask installs the DMG this job just published, so its checksum
+          # only exists now; the formula builds from the tag it points at.
+          /usr/bin/sed -i '' \
+            -e "s/^  version \".*\"$/  version \"${VERSION}\"/" \
+            -e "s/^  sha256 \".*\"$/  sha256 \"${SHA}\"/" \
+            Casks/sweepmac.rb
+          /usr/bin/sed -i '' \
+            -e "s/^      tag:   \".*\"$/      tag:   \"${GITHUB_REF_NAME}\"/" \
+            -e "s/^  version \".*\"$/  version \"${VERSION}\"/" \
+            Formula/sweepmac.rb
+          if git diff --quiet Casks/sweepmac.rb Formula/sweepmac.rb; then
+            echo "already at ${VERSION}"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Point the cask and formula at ${GITHUB_REF_NAME}" \
+            Casks/sweepmac.rb Formula/sweepmac.rb
+          git push origin main

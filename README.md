@@ -37,35 +37,44 @@ dependency-free.
 
 ## Install
 
-### Homebrew (recommended)
-
-The repo doubles as a Homebrew tap ([Formula/sweepmac.rb](Formula/sweepmac.rb)).
-It builds from source on your machine, so there are no Gatekeeper warnings and
-no signing required:
+### Homebrew cask — the app (recommended)
 
 ```bash
 brew tap karol-blaszczyk/sweepmac https://github.com/karol-blaszczyk/sweepmac
-brew install sweepmac        # installs sweepmac, sweepmac-gui, sweepmac-tray
+brew install --cask sweepmac
 ```
 
-Update later with `brew upgrade sweepmac` (or `brew install --HEAD sweepmac`
-to track `main`).
+That drops `sweepmac.app` in `/Applications` (the menu-bar agent) and puts the
+`sweepmac` and `sweepmac-gui` binaries on your PATH from inside the bundle, so
+one command gets you all three front-ends. `brew upgrade --cask sweepmac`
+updates it; `brew uninstall --cask sweepmac` removes it cleanly.
+
+The DMG behind the cask is **not signed or notarized**, so the first launch
+needs one extra step: open it once from Finder with right-click → **Open**, or
+allow it under **System Settings → Privacy & Security → "Open Anyway"**.
+
+### Homebrew formula — CLI only
+
+Builds from source on your machine, so nothing is ever quarantined and no
+signing is involved. No `.app`: you get three binaries and run the tray from a
+terminal.
+
+```bash
+brew install karol-blaszczyk/sweepmac/sweepmac   # sweepmac, sweepmac-gui, sweepmac-tray
+```
+
+Track `main` with `brew install --HEAD karol-blaszczyk/sweepmac/sweepmac`.
 
 ### DMG
 
-Each [release](https://github.com/karol-blaszczyk/sweepmac/releases) attaches a
-`sweepmac.dmg` with a drag-to-install `sweepmac.app` (the menu-bar app, with the
-CLI and GUI binaries bundled inside). The DMG is **not signed or notarized**, so
-Gatekeeper will refuse to open it at first: allow it under
-**System Settings → Privacy & Security → "Open Anyway"**, or clear the
-quarantine flag:
+Every [release](https://github.com/karol-blaszczyk/sweepmac/releases) attaches a
+`sweepmac.dmg` with a drag-to-install `sweepmac.app` — the same artifact the
+cask installs, if you would rather not go through Homebrew. Same Gatekeeper
+step as above, or clear the flag yourself:
 
 ```bash
 xattr -d com.apple.quarantine /Applications/sweepmac.app
 ```
-
-If that puts you off (fair!), use Homebrew — locally built binaries are never
-quarantined.
 
 ### From a checkout
 

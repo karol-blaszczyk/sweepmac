@@ -21,3 +21,12 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --features "gui tray pkg" -- -D warnings
+
+  cask:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit the Homebrew cask
+        run: |
+          brew style Casks/sweepmac.rb
+          brew audit --cask --strict Casks/sweepmac.rb
