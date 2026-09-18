@@ -28,5 +28,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Audit the Homebrew cask
         run: |
+          set -euo pipefail
           brew style Casks/sweepmac.rb
-          brew audit --cask --strict Casks/sweepmac.rb
+          # `brew audit` only takes a token, never a path, so the checkout has
+          # to stand in as the tap — auditing the published tap would check
+          # main rather than the commit under test.
+          TAP="$(brew --repository)/Library/Taps/karol-blaszczyk/homebrew-sweepmac"
+          mkdir -p "$(dirname "$TAP")"
+          cp -R "$GITHUB_WORKSPACE" "$TAP"
+          brew audit --cask --strict karol-blaszczyk/sweepmac/sweepmac
