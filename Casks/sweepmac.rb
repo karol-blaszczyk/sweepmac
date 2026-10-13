@@ -21,11 +21,12 @@ cask "sweepmac" do
   binary "#{appdir}/sweepmac.app/Contents/MacOS/sweepmac"
   binary "#{appdir}/sweepmac.app/Contents/MacOS/sweepmac-gui"
 
+  # The ai.sekondbrain.sweepmac entries are the pre-0.3.2 bundle id; harmless to
+  # also trash them.
   zap trash: [
-    "~/Library/Preferences/dev.sweepmac.sweepmac.plist",
-    "~/Library/Saved Application State/dev.sweepmac.sweepmac.savedState",
-    # Pre-0.3.2 installs used this bundle id; harmless to also trash it.
     "~/Library/Preferences/ai.sekondbrain.sweepmac.plist",
+    "~/Library/Preferences/dev.sweepmac.sweepmac.plist",
     "~/Library/Saved Application State/ai.sekondbrain.sweepmac.savedState",
+    "~/Library/Saved Application State/dev.sweepmac.sweepmac.savedState",
   ]
 end
