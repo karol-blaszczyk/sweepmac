@@ -177,8 +177,31 @@ pub const TARGETS: &[Target] = &[
     Target {
         id: "pnpm",
         category: "dev",
-        desc: "pnpm store cache",
+        desc: "pnpm metadata cache",
         rel: "Library/Caches/pnpm",
+        clear_contents: false,
+    },
+    Target {
+        // pnpm's default content-addressable store on macOS. Projects hold
+        // hard links into it, so deleting it never breaks a node_modules.
+        id: "pnpm-store",
+        category: "dev",
+        desc: "pnpm package store",
+        rel: "Library/pnpm/store",
+        clear_contents: false,
+    },
+    Target {
+        id: "uv",
+        category: "dev",
+        desc: "uv Python package cache",
+        rel: ".cache/uv",
+        clear_contents: false,
+    },
+    Target {
+        id: "puppeteer",
+        category: "dev",
+        desc: "Puppeteer browser cache",
+        rel: ".cache/puppeteer",
         clear_contents: false,
     },
     Target {
@@ -200,6 +223,13 @@ pub const TARGETS: &[Target] = &[
         category: "dev",
         desc: "npm cache",
         rel: ".npm/_cacache",
+        clear_contents: false,
+    },
+    Target {
+        id: "npx",
+        category: "dev",
+        desc: "npx package cache",
+        rel: ".npm/_npx",
         clear_contents: false,
     },
     Target {
@@ -352,6 +382,23 @@ pub const TARGETS: &[Target] = &[
         rel: "Library/Caches/Ableton",
         clear_contents: false,
     },
+    Target {
+        // The ChatGPT app's bundled Codex runtime (Python, Node, plugins).
+        // Opt-in because the app uses it while running; it re-downloads.
+        id: "codex",
+        category: "app",
+        desc: "ChatGPT Codex runtime",
+        rel: ".cache/codex-runtimes",
+        clear_contents: false,
+    },
+    // --- Downloaded ML models (opt-in: each one can be GBs to re-download) ---
+    Target {
+        id: "huggingface",
+        category: "models",
+        desc: "Hugging Face downloaded models",
+        rel: ".cache/huggingface/hub",
+        clear_contents: true,
+    },
 ];
 
 /// Categories cleaned when no explicit selection is given.
@@ -359,11 +406,14 @@ pub const DEFAULT_CLEAN_CATEGORIES: &[&str] = &["system", "macos", "dev", "xcode
 
 /// Every category, in display order.
 ///
+/// `models` is opt-in like `app`: models re-download, but slowly and at GB
+/// scale, so clearing them must be asked for.
+///
 /// `git` has no `TARGETS` entries — it is a discovery category, handled by
 /// [`find_git_repos`]. It is deliberately absent from
 /// `DEFAULT_CLEAN_CATEGORIES`: scanning repositories at all is a departure from
 /// the "git repos are never scanned" default, so it must be asked for.
-pub const ALL_CATEGORIES: &[&str] = &["system", "macos", "dev", "xcode", "app", "git"];
+pub const ALL_CATEGORIES: &[&str] = &["system", "macos", "dev", "xcode", "app", "models", "git"];
 
 /// A measured target ready to show or clean.
 pub struct ScanRow {
@@ -1335,6 +1385,13 @@ fn short_sha(sha: &str) -> String {
 
 /// Recursively sum the size of a directory, not following symlinks.
 pub fn dir_size(path: &Path) -> u64 {
+    dir_size_inner(path, &mut std::collections::HashSet::new())
+}
+
+/// `seen` holds the `(dev, ino)` of every multiply-linked file already
+/// counted. Like `du`, a hard-linked file counts once — Telegram hard-links
+/// its media, and counting every link doubled its reported size.
+fn dir_size_inner(path: &Path, seen: &mut std::collections::HashSet<(u64, u64)>) -> u64 {
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(_) => return 0,
@@ -1346,12 +1403,15 @@ pub fn dir_size(path: &Path) -> u64 {
     // sparse file like the Colima VM image reports real on-disk usage, not its
     // larger logical/apparent size.
     if meta.is_file() {
+        if meta.nlink() > 1 && !seen.insert((meta.dev(), meta.ino())) {
+            return 0;
+        }
         return meta.blocks() * 512;
     }
     let mut total = meta.blocks() * 512; // the directory entry itself
     if let Ok(entries) = fs::read_dir(path) {
         for entry in entries.flatten() {
-            total += dir_size(&entry.path());
+            total += dir_size_inner(&entry.path(), seen);
         }
     }
     total
@@ -1415,6 +1475,131 @@ pub fn extras() -> Vec<(&'static str, PathBuf, u64)> {
         }
     }
     out
+}
+
+/// Large app data sweepmac reports but never deletes: it holds messages,
+/// media or VM state that only the owning app (or a deliberate manual step)
+/// should clear. Each entry is `(label, path, hint)`; a path starting with `/`
+/// is absolute, anything else is relative to `$HOME`.
+pub const APP_DATA: &[(&str, &str, &str)] = &[
+    (
+        "Telegram media",
+        "Library/Group Containers/6N38VWS5BX.ru.keepcoder.Telegram",
+        "Telegram → Settings → Data and Storage → Storage Usage → Clear",
+    ),
+    (
+        "WhatsApp messages + media",
+        "Library/Group Containers/group.net.whatsapp.WhatsApp.shared",
+        "WhatsApp → Settings → Storage and Data → Manage Storage",
+    ),
+    (
+        "Claude desktop VM image",
+        "Library/Application Support/Claude/vm_bundles",
+        "re-downloads on next use; quit Claude, then delete the folder",
+    ),
+    (
+        "Cursor editor state (state.vscdb)",
+        "Library/Application Support/Cursor/User/globalStorage",
+        "quit Cursor, delete state.vscdb.backup (or uninstall Cursor)",
+    ),
+    (
+        "Colima VM disk",
+        ".colima/_lima",
+        "docker image prune -a, then `colima ssh -- sudo fstrim -a`",
+    ),
+    (
+        "OrbStack data",
+        "Library/Group Containers/HUAQ24HBR6.dev.orbstack",
+        "OrbStack → Settings → Storage, or delete if OrbStack is uninstalled",
+    ),
+    (
+        "Docker Desktop VM",
+        "Library/Containers/com.docker.docker",
+        "Docker Desktop → Troubleshoot → Clean / Purge data",
+    ),
+    (
+        "Unity editors",
+        "/Applications/Unity/Hub/Editor",
+        "Unity Hub → Installs → Uninstall unused versions",
+    ),
+];
+
+/// Entries below this size are left out of the app-data report: a 40 MB
+/// WhatsApp folder isn't worth a line.
+pub const APP_DATA_MIN_BYTES: u64 = 512 * 1024 * 1024;
+
+/// One measured [`APP_DATA`] entry (or the simulator runtimes).
+pub struct AppDataRow {
+    pub label: &'static str,
+    pub path: PathBuf,
+    pub size: u64,
+    pub hint: &'static str,
+}
+
+/// Measure [`APP_DATA`] plus iOS simulator runtimes, keeping entries of at
+/// least [`APP_DATA_MIN_BYTES`], largest first. Read-only.
+pub fn app_data() -> Vec<AppDataRow> {
+    let Ok(home) = home() else {
+        return Vec::new();
+    };
+    let mut out: Vec<AppDataRow> = APP_DATA
+        .iter()
+        .map(|&(label, rel, hint)| {
+            let path = if rel.starts_with('/') {
+                PathBuf::from(rel)
+            } else {
+                home.join(rel)
+            };
+            let size = dir_size(&path);
+            AppDataRow {
+                label,
+                path,
+                size,
+                hint,
+            }
+        })
+        .collect();
+    if let Some(size) = simctl_runtime_bytes() {
+        out.push(AppDataRow {
+            label: "iOS Simulator runtimes",
+            path: PathBuf::from("/Library/Developer/CoreSimulator"),
+            size,
+            hint: "xcrun simctl runtime list, then xcrun simctl runtime delete <id>",
+        });
+    }
+    out.retain(|r| r.size >= APP_DATA_MIN_BYTES);
+    out.sort_by_key(|r| std::cmp::Reverse(r.size));
+    out
+}
+
+/// Total size of the installed simulator runtime disk images. They live in a
+/// system location `dir_size` can't read, so ask `simctl`. `None` when Xcode's
+/// tools aren't installed.
+fn simctl_runtime_bytes() -> Option<u64> {
+    let out = output_with_timeout(
+        Command::new("xcrun").args(["simctl", "runtime", "list", "-j"]),
+        Duration::from_secs(10),
+    )?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(sum_size_bytes(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Sum every `"sizeBytes" : N` field in `simctl runtime list -j` output. No
+/// JSON dependency: the key appears exactly once per runtime image.
+fn sum_size_bytes(json: &str) -> u64 {
+    json.split("\"sizeBytes\"")
+        .skip(1)
+        .filter_map(|rest| {
+            let digits: String = rest
+                .trim_start_matches(|c: char| c == ':' || c.is_whitespace())
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            digits.parse::<u64>().ok()
+        })
+        .sum()
 }
 
 /// How many "unavailable" Simulator devices `xcrun simctl delete unavailable`
@@ -2160,6 +2345,24 @@ mod tests {
             assert!(ALL_CATEGORIES.contains(c));
         }
         assert!(!DEFAULT_CLEAN_CATEGORIES.contains(&"app"));
+        assert!(!DEFAULT_CLEAN_CATEGORIES.contains(&"models"));
+    }
+
+    #[test]
+    fn app_data_paths_are_sane() {
+        for (label, rel, hint) in APP_DATA {
+            assert!(!rel.is_empty() && !hint.is_empty(), "{label} is incomplete");
+            assert!(!rel.starts_with('~'), "{label}: use a $HOME-relative path");
+            assert!(!rel.split('/').any(|c| c == ".."), "{label}: path escapes");
+        }
+    }
+
+    #[test]
+    fn simctl_runtime_sizes_are_summed() {
+        let json = r#"{"A":{"sizeBytes" : 8014773567,"state":"Ready"},
+                       "B":{"sizeBytes":100}}"#;
+        assert_eq!(sum_size_bytes(json), 8014773667);
+        assert_eq!(sum_size_bytes("{}"), 0);
     }
 
     #[test]
@@ -2185,6 +2388,16 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn dir_size_counts_a_hard_linked_file_once() {
+        let dir = scratch_dir("hardlink");
+        fs::write(dir.join("a"), vec![7u8; 64 * 1024]).unwrap();
+        let single = dir_size(&dir);
+        fs::hard_link(dir.join("a"), dir.join("b")).unwrap();
+        assert_eq!(dir_size(&dir), single);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

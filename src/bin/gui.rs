@@ -1316,6 +1316,7 @@ const GROUPS: &[(&str, &[&str])] = &[
     ("Developer caches", &["dev", "xcode"]),
     ("System caches", &["system", "macos"]),
     ("App caches", &["app"]),
+    ("Downloaded ML models", &["models"]),
 ];
 
 fn cache_key(id: &str) -> String {
@@ -1742,6 +1743,13 @@ impl App {
                     tint: None,
                 },
                 |ui| {
+                    if *label == "Downloaded ML models" {
+                        ui.label(style::meta(
+                            &t,
+                            "Left unselected: each model re-downloads (often GBs) on next use.",
+                        ));
+                        ui.add_space(4.0);
+                    }
                     if *label == "App caches" {
                         ui.label(style::meta(
                             &t,

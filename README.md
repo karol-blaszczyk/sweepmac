@@ -181,13 +181,14 @@ sweepmac --help
 |----------|---------|
 | `system` | User logs + diagnostic reports (`~/Library/Logs`), Trash |
 | `macos`  | "Cleanup At Startup" temp staging |
-| `dev`    | Poetry, pip, Yarn, pnpm, npm, Playwright, Homebrew, Gradle, Maven, Cargo, Go build, JetBrains caches |
+| `dev`    | Poetry, pip, uv, Yarn, pnpm (cache + store), npm, npx, Playwright, Puppeteer, Homebrew, Gradle, Maven, Cargo, Go build, JetBrains caches |
 | `xcode`  | DerivedData (build cache), iOS DeviceSupport symbols |
 | `git`    | Git worktrees and their regenerable build dirs *(opt-in — the only category that looks inside a repository)* |
-| `app`    | Chrome, Firefox, Edge, Arc, Brave, Slack, Discord, VS Code, Zoom, Notion, Figma, Telegram, Spotify, Ableton caches *(opt-in — these re-download; apps you don't have scan as empty and are hidden)* |
+| `app`    | Chrome, Firefox, Edge, Arc, Brave, Slack, Discord, VS Code, Zoom, Notion, Figma, Telegram, Spotify, Ableton caches, ChatGPT Codex runtime *(opt-in — these re-download; apps you don't have scan as empty and are hidden)* |
+| `models` | Hugging Face downloaded models *(opt-in — each re-downloads, often GBs)* |
 
 `system`, `macos`, `dev`, and `xcode` are cleaned by default — note that
-includes **emptying the Trash**. `app` and `git` are opt-in via `--category` or
+includes **emptying the Trash**. `app`, `models` and `git` are opt-in via `--category` or
 `--all`, and you can narrow any run with `-c` (e.g. `-c dev,xcode` to leave
 Trash and logs alone). A bare `sweepmac` scan reports every cache but still
 does not walk repositories.

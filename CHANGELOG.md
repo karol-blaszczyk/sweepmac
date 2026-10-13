@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- New `dev` targets: uv cache (`~/.cache/uv`), npx cache (`~/.npm/_npx`),
+  pnpm package store (`~/Library/pnpm/store`) and Puppeteer browsers
+  (`~/.cache/puppeteer`). The existing `pnpm` entry only covered pnpm's
+  metadata cache, not its store.
+- New opt-in `app` target for the ChatGPT Codex runtime, and a new opt-in
+  `models` category for Hugging Face downloaded models.
+- The scan now reports large app data it never deletes (Telegram, WhatsApp,
+  Unity editors, the Claude VM image, simulator runtimes, Colima/OrbStack/
+  Docker Desktop VMs, Cursor state), each with how to clear it in the app.
+- Fixed `dir_size` counting a hard-linked file once per link; it now counts
+  it once, like `du` (Telegram's media reported at twice its real size).
+
 ## v0.3.2 — 2026-09-18
 
 - Renamed the app bundle identifier from `ai.sekondbrain.sweepmac` to

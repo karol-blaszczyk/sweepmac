@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::io::{self, Write};
 
 use sweepmac::{
-    clean_build_dir, clean_target, extras, find_git_repos, git_available, home, human,
+    app_data, clean_build_dir, clean_target, extras, find_git_repos, git_available, home, human,
     persist_pty_limit, pty_status, raise_pty_limit, remove_worktree, run_docker_prune,
     run_simctl_prune, scan, target_by_id, GitRepo, PtyLevel, Worktree, WorktreeKind,
     ALL_CATEGORIES, DEFAULT_CLEAN_CATEGORIES, TARGETS,
@@ -95,6 +95,7 @@ fn main() {
     }
 
     print_extras();
+    print_app_data();
     print_pty();
 
     if !opts.clean {
@@ -338,6 +339,20 @@ fn print_extras() {
     println!("    └ Docker build cache/images: --docker · old simulators: --simulators");
 }
 
+/// Large app data sweepmac never deletes — where the space is and how to
+/// clear it from the owning app.
+fn print_app_data() {
+    let rows = app_data();
+    if rows.is_empty() {
+        return;
+    }
+    println!("\n  Large app data (clear it in the app — sweepmac never deletes these):");
+    for r in rows {
+        println!("  • {:<34} {:>9}", truncate(r.label, 34), human(r.size));
+        println!("    └ {}", r.hint);
+    }
+}
+
 fn indent(s: &str) -> String {
     s.lines()
         .map(|l| format!("    {l}"))
@@ -525,7 +540,8 @@ fn print_help() {
 USAGE:
     sweepmac [scan]                 Dry run: scan and report sizes (default)
     sweepmac --clean                Clean default categories ({defaults})
-    sweepmac --clean --all          Also clean app caches (re-download)
+    sweepmac --clean --all          Also clean app caches + ML models (re-download)
+    sweepmac --clean -c models      Clean downloaded ML models only
     sweepmac --clean -c dev,xcode   Clean only the given categories
     sweepmac --clean --docker       Also prune Docker build cache + images
     sweepmac --clean --simulators   Also delete unavailable iOS simulators
@@ -537,7 +553,7 @@ USAGE:
 
 OPTIONS:
     -c, --category <csv>   Comma-separated categories: {cats}
-        --all              Include every category (adds app caches AND git)
+        --all              Include every category (adds app caches, models AND git)
         --clean            Actually delete (otherwise it's a dry run)
     -y, --yes              Skip the confirmation prompt
         --docker           Run `docker builder/image prune -af`
@@ -560,6 +576,6 @@ CATEGORIES:",
         "git"
     );
     println!(
-        "\nSafe by default: only regenerable caches are touched, and nothing is\ndeleted without --clean. App caches and the git category are opt-in, and\nrepositories are only looked at when you ask for `-c git` (or --all).\nEven then, --clean only deletes regenerable build dirs; removing a worktree\nis always one explicit --remove-worktree at a time, and only when sweepmac\nhas verified its content is already on the default branch.\n"
+        "\nSafe by default: only regenerable caches are touched, and nothing is\ndeleted without --clean. App caches, ML models and the git category are opt-in, and\nrepositories are only looked at when you ask for `-c git` (or --all).\nEven then, --clean only deletes regenerable build dirs; removing a worktree\nis always one explicit --remove-worktree at a time, and only when sweepmac\nhas verified its content is already on the default branch.\n"
     );
 }
