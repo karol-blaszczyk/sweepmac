@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.3.3 — 2026-10-15
 
 - New `dev` targets: uv cache (`~/.cache/uv`), npx cache (`~/.npm/_npx`),
   pnpm package store (`~/Library/pnpm/store`) and Puppeteer browsers
